@@ -1,0 +1,10 @@
+{
+  "id": "rhen-vault",
+  "name": "Rhen Vault",
+  "version": "0.5.12",
+  "minAppVersion": "1.8.7",
+  "description": "Seals locked notes at rest so local AI agents read ciphertext instead of the note.",
+  "author": "Mark Schmidt",
+  "authorUrl": "https://github.com/markaschmidt",
+  "isDesktopOnly": true
+}

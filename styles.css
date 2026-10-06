@@ -1,0 +1,112 @@
+.rhen-modal .setting-item {
+  border-top: none;
+  padding-top: 0.5em;
+}
+
+.rhen-modal .rhen-note {
+  color: var(--text-muted);
+  font-size: 0.9em;
+  margin: 0 0 1em;
+}
+
+.rhen-file-input {
+  display: none;
+}
+
+.rhen-settings-lead {
+  margin-bottom: 1em;
+}
+
+.rhen-toast-host {
+  position: fixed;
+  right: 18px;
+  bottom: 36px;
+  z-index: 100000;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.slate-toast {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 12px 10px 12px 12px;
+  background: #1b1e27;
+  color: #f4f6fb;
+  border: 1px solid #4a2428;
+  border-left: 4px solid #e23d3d;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+  animation: rhen-toast-in 180ms ease-out;
+}
+
+.rhen-toast-badge {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: rgba(226, 61, 61, 0.16);
+  color: #ff5d5d;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rhen-toast-badge svg {
+  width: 20px;
+  height: 20px;
+}
+
+.rhen-toast-kicker {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #ff6b6b;
+}
+
+.rhen-toast-title {
+  font-size: 14px;
+  font-weight: 650;
+  margin-top: 1px;
+}
+
+.rhen-toast-detail {
+  margin-top: 4px;
+  color: #c5cad6;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.rhen-toast-file {
+  margin-top: 6px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: #ffffff;
+  word-break: break-all;
+}
+
+.rhen-toast-close {
+  border: none;
+  background: transparent;
+  color: #c5cad6;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+@keyframes rhen-toast-in {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
