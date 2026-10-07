@@ -1,6 +1,6 @@
 {
   "id": "rhen-info-vault",
-  "name": "Rhen Info Vault",
+  "name": "Rhen Vault",
   "version": "0.5.13",
   "minAppVersion": "1.8.7",
   "description": "Seals locked notes at rest so local AI agents read ciphertext instead of the note.",
