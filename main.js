@@ -1319,7 +1319,7 @@ var ConfirmModal = class extends import_obsidian2.Modal {
     contentEl.createEl("h2", { text: this.copy.title });
     contentEl.createEl("p", { cls: "rhen-note", text: this.copy.body });
     new import_obsidian2.Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton(
-      (button) => button.setButtonText(this.copy.confirm).setWarning().onClick(() => {
+      (button) => button.setButtonText(this.copy.confirm).setDestructive().onClick(() => {
         this.close();
         this.onConfirm();
       })
@@ -1433,144 +1433,206 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
     super(app, plugin);
     this.controller = plugin;
   }
-  display() {
-    const { containerEl } = this;
-    containerEl.empty();
-    new import_obsidian2.Setting(containerEl).setName(`Rhen Vault ${this.controller.manifest.version}`).setHeading();
+  getSettingDefinitions() {
     const blocked = this.controller.agentBlockLabels();
     const locks = this.controller.settings.lockedFolders.length + this.controller.settings.lockedFiles.length;
     const status = !this.controller.settings.verifier ? "Set a passphrase, then right-click a note or folder and choose Lock from AI." : this.controller.isUnlocked() ? `Session open. ${locks} lock ${locks === 1 ? "rule" : "rules"}. Locked notes stay encrypted on disk.` : "Session locked. Unlock to edit locked notes. They stay encrypted on disk.";
-    containerEl.createEl("p", { cls: "rhen-settings-lead", text: status });
-    containerEl.createEl("p", {
-      cls: "rhen-note",
-      text: blocked.length ? `${blocked.join(", ")} is enabled. A read of a locked note from that plugin raises a block alert.` : "Right-click a note to lock it, or a folder to lock that folder and its subfolders."
-    });
-    containerEl.createEl("p", {
-      cls: "rhen-note",
-      text: "Rhen Vault seals markdown, text, and canvas files inside a lock, and also images, PDFs, audio, and video stored in that lock. Obsidian shows those embeds while Rhen Vault is unlocked. A plugin that reads the file on its own still gets ciphertext. File recovery can keep plaintext snapshots. Turn that core plugin off."
-    });
-    if (!this.controller.settings.verifier) {
-      new import_obsidian2.Setting(containerEl).setName("Create a passphrase").addButton(
-        (button) => button.setButtonText("Set passphrase").setCta().onClick(() => this.controller.openSetup())
-      );
-    } else if (this.controller.isUnlocked()) {
-      new import_obsidian2.Setting(containerEl).setName("Lock").addButton(
-        (button) => button.setButtonText("Lock").onClick(() => this.controller.lock())
-      );
-    } else {
-      new import_obsidian2.Setting(containerEl).setName("Unlock").addButton(
-        (button) => button.setButtonText("Unlock").setCta().onClick(() => this.controller.openUnlock())
-      );
-    }
-    new import_obsidian2.Setting(containerEl).setName("Sealed extensions").setDesc("Comma-separated. Defaults to md, txt, canvas.").addText(
-      (text) => text.setValue(this.controller.settings.extensions.join(", ")).onChange(async (value) => {
-        const extensions = value.split(",").map((item) => item.trim().replace(/^\./, "").toLowerCase()).filter(Boolean);
-        this.controller.settings.extensions = extensions.length ? extensions : ["md", "txt", "canvas"];
-        this.controller.state.extensions = this.controller.settings.extensions;
-        await this.controller.saveSettings();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Additional blocked plugins").setDesc("Claudian, Copilot, ChatGPT MD, AI Agent, and Agent are always blocked. Add other plugin ids, separated by commas.").addText(
-      (text) => text.setPlaceholder("plugin-id").setValue(this.controller.settings.extraBlockedPluginIds.join(", ")).onChange(async (value) => {
-        this.controller.settings.extraBlockedPluginIds = value.split(",").map((item) => item.trim()).filter(Boolean);
-        await this.controller.saveSettings();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Seal locked notes").setDesc("Encrypt plaintext notes that are already covered by a lock. Already sealed notes are left as they are.").addButton(
-      (button) => button.setButtonText("Seal locked notes").onClick(async () => {
-        try {
-          const count = await this.controller.sealAll();
-          new import_obsidian2.Notice(count === 0 ? "No plaintext notes to seal." : `Sealed ${count} notes.`);
-        } catch {
-          new import_obsidian2.Notice("Unlock Rhen Vault before sealing notes.");
+    const blockStatus = blocked.length ? `${blocked.join(", ")} is enabled. A read of a locked note from that plugin raises a block alert.` : "Right-click a note to lock it, or a folder to lock that folder and its subfolders.";
+    return [
+      {
+        name: `Rhen Vault ${this.controller.manifest.version}`,
+        desc: `${status} ${blockStatus}`,
+        searchable: false,
+        render: (setting) => {
+          setting.setHeading();
         }
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Write ignore files").setDesc("Writes AGENTS.md, CLAUDE.md, GEMINI.md, and merges the lock list into harness ignore files, deny rules for Claude Code, OpenCode, Grok Build, and Pi, and Obsidian excluded files. Existing files without the Rhen Vault marker are left alone, except ignore files which gain a marked block.").addButton(
-      (button) => button.setButtonText("Write shield files").onClick(async () => {
-        const result = await this.controller.writeShields();
-        const skipped = result.skipped.length ? ` Left ${result.skipped.join(", ")} unchanged.` : "";
-        new import_obsidian2.Notice(`Wrote ${result.written.length} shield files.${skipped}`);
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Codex deny rules").setDesc("Codex only reads deny rules from your user config, which Rhen Vault does not edit. Copy these and paste them into ~/.codex/config.toml under your profile's filesystem table.").addButton(
-      (button) => button.setButtonText("Copy").onClick(async () => {
-        try {
-          await navigator.clipboard.writeText(this.controller.codexRules());
-          new import_obsidian2.Notice("Copied Codex deny rules.");
-        } catch {
-          new import_obsidian2.Notice("Rhen Vault could not copy to the clipboard.");
-        }
-      })
-    );
-    if (this.controller.settings.verifier) {
-      new import_obsidian2.Setting(containerEl).setName("Recovery file").setDesc("Holds the salt and verifier, never the secret. Export before uninstalling: uninstalling deletes the salt, and the same passphrase alone will not reopen sealed notes. Import after reinstalling, then unlock with the original secret.").addButton(
-        (button) => button.setButtonText("Safe uninstall steps").onClick(() => this.controller.showRecoveryInfo())
-      ).addButton(
-        (button) => button.setButtonText("Export").onClick(() => {
-          const json = this.controller.exportRecovery();
-          if (!json) {
-            new import_obsidian2.Notice("Rhen Vault has no secret to back up yet.");
-            return;
-          }
-          downloadTextFile("rhen-vault-recovery.json", json);
-          new import_obsidian2.Notice("Recovery file exported. Keep it somewhere safe.");
-        })
-      ).addButton(
-        (button) => button.setButtonText("Import").onClick(() => {
-          const input = containerEl.createEl("input", {
-            cls: "rhen-file-input",
-            type: "file",
-            attr: { accept: ".json,application/json" }
-          });
-          input.onchange = () => {
-            const file = input.files?.[0];
-            if (!file) return;
-            void file.text().then((text) => this.controller.importRecoveryFile(JSON.parse(text))).then((ok) => {
-              new import_obsidian2.Notice(
-                ok ? "Recovery file imported. Unlock with the original secret." : "That file is not a Rhen Vault recovery file."
-              );
-            }).catch(() => new import_obsidian2.Notice("Rhen Vault could not read that file."));
-          };
-          input.click();
-        })
-      );
-    }
-    if (this.controller.isAccountProtected()) {
-      new import_obsidian2.Setting(containerEl).setName("Separate Windows account").setDesc("On. Only the protected account, SYSTEM, and elevated administrators can open this vault's files. AI tools running in your normal account cannot read or change them, even when Obsidian is closed.").addButton(
-        (button) => button.setButtonText("Undo").setWarning().onClick(() => this.controller.confirmAccountUndo())
-      );
-    } else if (this.controller.canUseAccountProtection()) {
-      new import_obsidian2.Setting(containerEl).setName("Separate Windows account").setDesc("Strongest option. Moves this vault into a folder that your normal Windows account, and every AI tool running in it, cannot open, even when Obsidian is closed. You open it from an Obsidian (Protected) shortcut on the same desktop. Needs admin approval once.").addButton(
-        (button) => button.setButtonText("Set up").onClick(() => this.controller.confirmAccountProtection())
-      );
-    }
-    new import_obsidian2.Setting(containerEl).setName("Plugin file protection").setDesc("Rhen Vault refuses to unlock while another account can rewrite the plugin files, because a changed plugin could capture the passphrase. Locked notes stay encrypted. Check here to see who is listed and how to fix it.").addButton(
-      (button) => button.setButtonText("Check now").onClick(() => {
-        void this.controller.checkPluginWriters().then((writers) => {
-          if (writers.length > 0) this.controller.showExposureInfo(writers);
-          else new import_obsidian2.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
-        });
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Unseal notes").setDesc("Writes note text back to disk as plaintext. Local agents will be able to read them.").addButton(
-      (button) => button.setButtonText("Unseal").setWarning().onClick(() => {
-        new ConfirmModal(
-          this.app,
-          {
-            title: "Unseal notes?",
-            body: "This writes note text back to disk as plaintext. Claudian, Cursor, Claude, and Codex will be able to read those files.",
-            confirm: "Unseal"
-          },
-          () => {
-            void this.controller.unsealAll().then(
-              (count) => new import_obsidian2.Notice(`Unsealed ${count} notes.`),
-              () => new import_obsidian2.Notice("Unlock Rhen Vault before unsealing notes.")
+      },
+      {
+        name: "Session",
+        desc: "Unlock to edit locked notes. The key stays in memory and locked files remain encrypted on disk.",
+        render: (setting) => {
+          if (!this.controller.settings.verifier) {
+            setting.addButton(
+              (button) => button.setButtonText("Set passphrase").setCta().onClick(() => this.controller.openSetup())
+            );
+          } else if (this.controller.isUnlocked()) {
+            setting.addButton(
+              (button) => button.setButtonText("Lock").onClick(() => {
+                this.controller.lock();
+                this.update();
+              })
+            );
+          } else {
+            setting.addButton(
+              (button) => button.setButtonText("Unlock").setCta().onClick(() => this.controller.openUnlock())
             );
           }
-        ).open();
-      })
-    );
+        }
+      },
+      {
+        name: "Sealed extensions",
+        desc: "Comma-separated. Defaults to md, txt, canvas.",
+        render: (setting) => {
+          setting.addText(
+            (text) => text.setValue(this.controller.settings.extensions.join(", ")).onChange(async (value) => {
+              const extensions = value.split(",").map((item) => item.trim().replace(/^\./, "").toLowerCase()).filter(Boolean);
+              this.controller.settings.extensions = extensions.length ? extensions : ["md", "txt", "canvas"];
+              this.controller.state.extensions = this.controller.settings.extensions;
+              await this.controller.saveSettings();
+            })
+          );
+        }
+      },
+      {
+        name: "Additional blocked plugins",
+        desc: "Claudian, Copilot, ChatGPT MD, AI Agent, and Agent are always blocked. Add other plugin ids, separated by commas.",
+        render: (setting) => {
+          setting.addText(
+            (text) => text.setPlaceholder("plugin-id").setValue(this.controller.settings.extraBlockedPluginIds.join(", ")).onChange(async (value) => {
+              this.controller.settings.extraBlockedPluginIds = value.split(",").map((item) => item.trim()).filter(Boolean);
+              await this.controller.saveSettings();
+            })
+          );
+        }
+      },
+      {
+        name: "Seal locked notes",
+        desc: "Encrypt plaintext notes already covered by a lock. Already sealed notes are left as they are.",
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Seal locked notes").onClick(async () => {
+              try {
+                const count = await this.controller.sealAll();
+                new import_obsidian2.Notice(count === 0 ? "No plaintext notes to seal." : `Sealed ${count} notes.`);
+              } catch {
+                new import_obsidian2.Notice("Unlock Rhen Vault before sealing notes.");
+              }
+            })
+          );
+        }
+      },
+      {
+        name: "Write ignore files",
+        desc: "Writes convenience shields and merges the lock list into supported harness ignore and deny files. Encryption remains the security boundary.",
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Write shield files").onClick(async () => {
+              const result = await this.controller.writeShields();
+              const skipped = result.skipped.length ? ` Left ${result.skipped.join(", ")} unchanged.` : "";
+              new import_obsidian2.Notice(`Wrote ${result.written.length} shield files.${skipped}`);
+            })
+          );
+        }
+      },
+      {
+        name: "Codex deny rules",
+        desc: "Copy these rules into ~/.codex/config.toml. Rhen Vault never writes TOML outside the vault.",
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Copy").onClick(async () => {
+              try {
+                await navigator.clipboard.writeText(this.controller.codexRules());
+                new import_obsidian2.Notice("Copied Codex deny rules.");
+              } catch {
+                new import_obsidian2.Notice("Rhen Vault could not copy to the clipboard.");
+              }
+            })
+          );
+        }
+      },
+      {
+        name: "Recovery file",
+        desc: "Holds the salt and verifier, never the secret. Export it before uninstalling.",
+        visible: () => Boolean(this.controller.settings.verifier),
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Safe uninstall steps").onClick(() => this.controller.showRecoveryInfo())
+          ).addButton(
+            (button) => button.setButtonText("Export").onClick(() => {
+              const json = this.controller.exportRecovery();
+              if (!json) {
+                new import_obsidian2.Notice("Rhen Vault has no secret to back up yet.");
+                return;
+              }
+              downloadTextFile("rhen-vault-recovery.json", json);
+              new import_obsidian2.Notice("Recovery file exported. Keep it somewhere safe.");
+            })
+          ).addButton(
+            (button) => button.setButtonText("Import").onClick(() => {
+              const input = setting.controlEl.createEl("input", {
+                cls: "rhen-file-input",
+                type: "file",
+                attr: { accept: ".json,application/json" }
+              });
+              input.onchange = () => {
+                const file = input.files?.[0];
+                if (!file) return;
+                void file.text().then((text) => this.controller.importRecoveryFile(JSON.parse(text))).then((ok) => {
+                  new import_obsidian2.Notice(
+                    ok ? "Recovery file imported. Unlock with the original secret." : "That file is not a Rhen Vault recovery file."
+                  );
+                }).catch(() => new import_obsidian2.Notice("Rhen Vault could not read that file."));
+              };
+              input.click();
+            })
+          );
+        }
+      },
+      {
+        name: "Separate Windows account",
+        desc: this.controller.isAccountProtected() ? "On. Only the protected account, SYSTEM, and elevated administrators can open this vault's files." : "Strongest option. Moves this vault where the normal Windows account and its AI tools cannot open it.",
+        visible: () => this.controller.isAccountProtected() || this.controller.canUseAccountProtection(),
+        render: (setting) => {
+          if (this.controller.isAccountProtected()) {
+            setting.addButton(
+              (button) => button.setButtonText("Undo").setDestructive().onClick(() => this.controller.confirmAccountUndo())
+            );
+          } else {
+            setting.addButton(
+              (button) => button.setButtonText("Set up").onClick(() => this.controller.confirmAccountProtection())
+            );
+          }
+        }
+      },
+      {
+        name: "Plugin file protection",
+        desc: "Rhen Vault refuses to unlock while another account can rewrite the plugin files. Check who is listed and how to fix it.",
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Check now").onClick(() => {
+              void this.controller.checkPluginWriters().then((writers) => {
+                if (writers.length > 0) this.controller.showExposureInfo(writers);
+                else new import_obsidian2.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
+              });
+            })
+          );
+        }
+      },
+      {
+        name: "Unseal notes",
+        desc: "Writes note text back to disk as plaintext. Local agents will be able to read it.",
+        render: (setting) => {
+          setting.addButton(
+            (button) => button.setButtonText("Unseal").setDestructive().onClick(() => {
+              new ConfirmModal(
+                this.app,
+                {
+                  title: "Unseal notes?",
+                  body: "This writes note text back to disk as plaintext. Claudian, Cursor, Claude, and Codex will be able to read those files.",
+                  confirm: "Unseal"
+                },
+                () => {
+                  void this.controller.unsealAll().then(
+                    (count) => new import_obsidian2.Notice(`Unsealed ${count} notes.`),
+                    () => new import_obsidian2.Notice("Unlock Rhen Vault before unsealing notes.")
+                  );
+                }
+              ).open();
+            })
+          );
+        }
+      }
+    ];
   }
 };
 
