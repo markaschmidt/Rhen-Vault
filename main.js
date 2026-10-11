@@ -35,9 +35,9 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_child_process = require("child_process");
-var import_fs6 = __toESM(require("fs"), 1);
+var import_fs7 = __toESM(require("fs"), 1);
 var path2 = __toESM(require("path"), 1);
-var import_obsidian5 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 
 // src/sealing/attachments.ts
 var ATTACHMENT_TYPES = {
@@ -366,7 +366,7 @@ var PROSE = `<!-- ${SHIELD_MARKER} -->
 
 Rhen Vault encrypts note text before it is written to disk. A file that starts with \`SLATE1:\` is ciphertext.
 
-Do not decrypt those files. Do not ask for the passphrase. Do not copy note text out of Obsidian.
+Do not decrypt those files. Do not ask for the password or the unlock image. Do not copy note text out of Obsidian.
 
 This file is not a security boundary. A local process can still read the ciphertext bytes. Images, PDFs, audio, and video inside a lock are sealed too. A plugin that reads those files without going through Obsidian still gets ciphertext.
 `;
@@ -626,6 +626,7 @@ var DEFAULT_SETTINGS = {
   salt: null,
   verifier: null,
   secretKind: "passphrase",
+  imageHint: null,
   kdfN: DEFAULT_KDF.N,
   kdfR: DEFAULT_KDF.r,
   kdfP: DEFAULT_KDF.p,
@@ -646,6 +647,18 @@ var DEFAULT_SETTINGS = {
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function asImageHint(value) {
+  if (!isRecord(value)) return null;
+  const name = typeof value.name === "string" ? value.name.trim().slice(0, 200) : "";
+  const width = value.width;
+  const height = value.height;
+  const bytes = value.bytes;
+  if (!name) return null;
+  if (!Number.isInteger(width) || width < 1 || width > 1e5) return null;
+  if (!Number.isInteger(height) || height < 1 || height > 1e5) return null;
+  if (!Number.isInteger(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) return null;
+  return { name, width, height, bytes };
+}
 function mergeSettings(loaded) {
   const source = isRecord(loaded) ? loaded : null;
   const merged = { ...DEFAULT_SETTINGS, ...source ?? {} };
@@ -663,6 +676,7 @@ function mergeSettings(loaded) {
   merged.syncedPiDenies = cleanEntries(merged.syncedPiDenies);
   merged.syncedObsidianFilters = cleanEntries(merged.syncedObsidianFilters);
   merged.secretKind = merged.secretKind === "image" ? "image" : "passphrase";
+  merged.imageHint = asImageHint(source?.imageHint);
   delete merged.helloCredentialId;
   if (!merged.kdfN) merged.kdfN = DEFAULT_KDF.N;
   if (!merged.kdfR) merged.kdfR = DEFAULT_KDF.r;
@@ -1000,22 +1014,22 @@ var GuardSync = class {
 // src/visuals/toast.ts
 var import_obsidian = require("obsidian");
 var COPY = {
-  read: { kicker: "Blocked", title: "Read blocked", detail: (agent) => `${agent} tried to read a locked note.` },
-  modify: { kicker: "Blocked", title: "Change blocked", detail: (agent) => `${agent} tried to change a locked note.` },
+  read: { kicker: "Blocked", title: "Read blocked", detail: (agent) => `${agent} tried to read a locked file.` },
+  modify: { kicker: "Blocked", title: "Change blocked", detail: (agent) => `${agent} tried to change a locked file.` },
   resealed: {
     kicker: "Sealed",
     title: "Outside change sealed",
-    detail: (agent) => `${agent} wrote plaintext into a locked note. Rhen Vault encrypted it again.`
+    detail: (agent) => `${agent} wrote plaintext into a locked file. Rhen Vault encrypted it again.`
   },
   pending: {
     kicker: "Exposed",
     title: "Unlock to re-seal",
-    detail: (agent) => `${agent} wrote plaintext into a locked note. Unlock Rhen Vault to encrypt it.`
+    detail: (agent) => `${agent} wrote plaintext into a locked file. Unlock Rhen Vault to encrypt it.`
   },
   waiting: {
     kicker: "Locked",
     title: "Not encrypted yet",
-    detail: () => "You created this note in a locked folder. Rhen Vault encrypts it when you unlock."
+    detail: () => "You added this file inside a lock. Rhen Vault encrypts it when you unlock."
   }
 };
 var AccessToasts = class {
@@ -1060,7 +1074,7 @@ var AccessToasts = class {
   }
 };
 
-// src/visuals/ui.ts
+// src/visuals/session.ts
 var import_obsidian2 = require("obsidian");
 
 // src/secrets/image-secret.ts
@@ -1092,7 +1106,43 @@ function byteHex(value) {
   return (value & 255).toString(16).padStart(2, "0");
 }
 
-// src/visuals/ui.ts
+// src/secrets/image-pixels.ts
+var SECRET_IMAGE_EXTENSIONS = /* @__PURE__ */ new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"]);
+function isSecretImagePath(vaultPath) {
+  const dot = vaultPath.lastIndexOf(".");
+  if (dot === -1) return false;
+  return SECRET_IMAGE_EXTENSIONS.has(vaultPath.slice(dot + 1).toLowerCase());
+}
+async function secretFromBlob(blob, salt) {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const scale = Math.min(1, 512 / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("Rhen Vault could not read that image.");
+    context.drawImage(bitmap, 0, 0, width, height);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    return { secret: imageSampleSecret(pixels, width, height, salt), width: bitmap.width, height: bitmap.height };
+  } finally {
+    bitmap.close();
+  }
+}
+async function findSecretImage(paths, readSecret, secret) {
+  for (const vaultPath of paths) {
+    let candidate = null;
+    try {
+      candidate = await readSecret(vaultPath);
+    } catch {
+      candidate = null;
+    }
+    if (candidate !== null && candidate === secret) return vaultPath;
+  }
+  return null;
+}
+
+// src/visuals/session.ts
 var SetupModal = class extends import_obsidian2.Modal {
   constructor(app, vaultPath, onSubmit) {
     super(app);
@@ -1108,7 +1158,7 @@ var SetupModal = class extends import_obsidian2.Modal {
     contentEl.createEl("h2", { text: "Set how Rhen Vault unlocks" });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "The secret stays in memory for this session. Nothing is locked until you right-click a note or folder and choose Lock from AI. A locked folder includes its subfolders. Export a recovery file from Rhen Vault settings before uninstalling: uninstalling deletes the salt, and the same passphrase alone will not reopen sealed notes."
+      text: "The secret stays in memory for this session. Nothing is locked until you right-click a note or folder and choose Lock from AI. A locked folder includes its subfolders, and images, PDFs, audio, and video inside a lock are sealed too. Export a recovery file from Rhen Vault settings before uninstalling: uninstalling deletes the salt, and the same password or image alone will not reopen sealed notes."
     });
     contentEl.createEl("p", {
       cls: "rhen-note",
@@ -1142,9 +1192,10 @@ var SetupModal = class extends import_obsidian2.Modal {
     contentEl.createEl("h3", { text: "Image" });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Rhen Vault samples 128 colors from the picture and uses them as the secret. The picture is not saved. Keep that file outside this vault and outside any folder an AI tool can open, and do not edit it. You will choose the same file again to unlock."
+      text: "Rhen Vault samples 128 colors from the same places in the picture every time, so the right file always unlocks. The picture is not saved. Its name and size are remembered. Moving or renaming the file is fine. Editing or re-saving it changes the pixels and will fail. Keep it outside this vault. If a copy is added to the vault later, Rhen Vault warns you and can delete that copy. The original outside the vault stays."
     });
     const imageInput = contentEl.createEl("input", { cls: "rhen-file-input", type: "file" });
+    imageInput.hidden = true;
     imageInput.accept = "image/*";
     imageInput.addEventListener("change", () => {
       const file = imageInput.files?.[0];
@@ -1179,10 +1230,10 @@ var SetupModal = class extends import_obsidian2.Modal {
     }
     try {
       const salt = crypto.getRandomValues(new Uint8Array(16));
-      const secret = await secretFromImage(file, salt);
+      const { secret, width, height } = await secretFromImage(file, salt);
       const shields = this.shields;
       this.close();
-      this.onSubmit({ kind: "image", secret, shields, salt });
+      this.onSubmit({ kind: "image", secret, shields, salt, imageHint: { name: file.name, width, height, bytes: file.size } });
     } catch (error) {
       new import_obsidian2.Notice(error instanceof Error ? error.message : "Rhen Vault could not read that image.");
     }
@@ -1194,21 +1245,23 @@ var SetupModal = class extends import_obsidian2.Modal {
   }
 };
 var UnlockModal = class extends import_obsidian2.Modal {
-  constructor(app, kind, vaultPath, salt, onSubmit) {
+  constructor(app, kind, vaultPath, salt, onSubmit, hint = null, options = {}) {
     super(app);
     this.kind = kind;
     this.vaultPath = vaultPath;
     this.salt = salt;
     this.onSubmit = onSubmit;
+    this.hint = hint;
+    this.options = options;
   }
   passphrase = "";
   onOpen() {
     const { contentEl } = this;
     this.modalEl.addClass("rhen-modal");
-    contentEl.createEl("h2", { text: "Unlock Rhen Vault" });
+    contentEl.createEl("h2", { text: this.options.title ?? "Unlock Rhen Vault" });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Notes stay encrypted on disk after unlock. Obsidian decrypts them in memory so you can edit."
+      text: this.options.intro ?? "Notes stay encrypted on disk after unlock. Obsidian decrypts them in memory so you can edit."
     });
     if (this.kind === "image") this.imageUnlock(contentEl);
     else this.passwordUnlock(contentEl);
@@ -1225,15 +1278,16 @@ var UnlockModal = class extends import_obsidian2.Modal {
       });
     });
     new import_obsidian2.Setting(contentEl).addButton(
-      (button) => button.setButtonText("Unlock").setCta().onClick(() => this.submitPassword())
+      (button) => button.setButtonText(this.options.confirm ?? "Unlock").setCta().onClick(() => this.submitPassword())
     );
   }
   imageUnlock(contentEl) {
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Choose the same image file you used when Rhen Vault was set up. It still has to sit outside this vault."
+      text: this.options.showHint !== false && this.hint ? `Choose the same image file you used when Rhen Vault was set up: ${this.hint.name} (${this.hint.width} by ${this.hint.height}, ${this.hint.bytes} bytes). Moving or renaming it is fine. A copy with different pixels will fail. It still has to sit outside this vault.` : "Choose the same image file you used when Rhen Vault was set up. Moving or renaming it is fine. A copy with different pixels will fail. It still has to sit outside this vault."
     });
     const imageInput = contentEl.createEl("input", { cls: "rhen-file-input", type: "file" });
+    imageInput.hidden = true;
     imageInput.accept = "image/*";
     imageInput.addEventListener("change", () => {
       const file = imageInput.files?.[0];
@@ -1247,8 +1301,8 @@ var UnlockModal = class extends import_obsidian2.Modal {
   submitPassword() {
     const secret = this.passphrase;
     this.passphrase = "";
+    if (this.onSubmit(secret) === false) return;
     this.close();
-    this.onSubmit(secret);
   }
   async submitImage(file) {
     if (!this.salt) {
@@ -1261,9 +1315,9 @@ var UnlockModal = class extends import_obsidian2.Modal {
       return;
     }
     try {
-      const secret = await secretFromImage(file, this.salt);
+      const { secret } = await secretFromImage(file, this.salt);
+      if (this.onSubmit(secret) === false) return;
       this.close();
-      this.onSubmit(secret);
     } catch (error) {
       new import_obsidian2.Notice(error instanceof Error ? error.message : "Rhen Vault could not read that image.");
     }
@@ -1271,6 +1325,7 @@ var UnlockModal = class extends import_obsidian2.Modal {
   onClose() {
     this.passphrase = "";
     this.contentEl.empty();
+    this.options.onDismiss?.();
   }
 };
 function fileLocation(file) {
@@ -1289,25 +1344,13 @@ function imageInsideVault(filePath, vaultPath) {
   const vault = vaultPath.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
   return file === vault || file.startsWith(`${vault}\\`);
 }
-async function secretFromImage(file, salt) {
-  const bitmap = await createImageBitmap(file);
-  try {
-    const scale = Math.min(1, 512 / Math.max(bitmap.width, bitmap.height));
-    const width = Math.max(1, Math.round(bitmap.width * scale));
-    const height = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = createFragment().createEl("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    if (!context) throw new Error("Rhen Vault could not read that image.");
-    context.drawImage(bitmap, 0, 0, width, height);
-    const pixels = context.getImageData(0, 0, width, height).data;
-    return imageSampleSecret(pixels, width, height, salt);
-  } finally {
-    bitmap.close();
-  }
+function secretFromImage(file, salt) {
+  return secretFromBlob(file, salt);
 }
-var ConfirmModal = class extends import_obsidian2.Modal {
+
+// src/visuals/confirm.ts
+var import_obsidian3 = require("obsidian");
+var ConfirmModal = class extends import_obsidian3.Modal {
   constructor(app, copy, onConfirm) {
     super(app);
     this.copy = copy;
@@ -1318,7 +1361,7 @@ var ConfirmModal = class extends import_obsidian2.Modal {
     this.modalEl.addClass("rhen-modal");
     contentEl.createEl("h2", { text: this.copy.title });
     contentEl.createEl("p", { cls: "rhen-note", text: this.copy.body });
-    new import_obsidian2.Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton(
+    new import_obsidian3.Setting(contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton(
       (button) => button.setButtonText(this.copy.confirm).setDestructive().onClick(() => {
         this.close();
         this.onConfirm();
@@ -1329,6 +1372,9 @@ var ConfirmModal = class extends import_obsidian2.Modal {
     this.contentEl.empty();
   }
 };
+
+// src/visuals/recovery.ts
+var import_obsidian4 = require("obsidian");
 function downloadTextFile(filename, text) {
   const blob = new Blob([text], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -1337,7 +1383,7 @@ function downloadTextFile(filename, text) {
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 5e3);
 }
-var UninstallNoticeModal = class extends import_obsidian2.Modal {
+var UninstallNoticeModal = class extends import_obsidian4.Modal {
   constructor(app, controller, onAck) {
     super(app);
     this.controller = controller;
@@ -1353,21 +1399,21 @@ var UninstallNoticeModal = class extends import_obsidian2.Modal {
     });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Uninstalling deletes Rhen Vault's settings, including the salt. After that, the same passphrase or image alone will not reopen sealed notes."
+      text: "Uninstalling deletes Rhen Vault's settings, including the salt. After that, the same password or image alone will not reopen sealed notes."
     });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Before uninstalling, either unseal your notes (plaintext goes back on disk), or export a recovery file and keep it somewhere safe. After reinstalling, import the recovery file and unlock with the original secret."
+      text: "Before uninstalling, either unseal your notes (plaintext goes back on disk), or export a recovery file and keep it somewhere safe. The file holds the salt and, for an image secret, the file name and size. It does not hold the password or the picture. After reinstalling, import it and unlock with the original secret."
     });
-    new import_obsidian2.Setting(contentEl).addButton(
+    new import_obsidian4.Setting(contentEl).addButton(
       (button) => button.setButtonText("Export recovery file").onClick(() => {
         const json = this.controller.exportRecovery();
         if (!json) {
-          new import_obsidian2.Notice("Rhen Vault has no secret to back up yet.");
+          new import_obsidian4.Notice("Rhen Vault has no secret to back up yet.");
           return;
         }
         downloadTextFile("rhen-vault-recovery.json", json);
-        new import_obsidian2.Notice("Recovery file exported. Keep it somewhere safe.");
+        new import_obsidian4.Notice("Recovery file exported. Keep it somewhere safe.");
       })
     ).addButton(
       (button) => button.setButtonText("I understand").setCta().onClick(() => {
@@ -1380,7 +1426,10 @@ var UninstallNoticeModal = class extends import_obsidian2.Modal {
     this.contentEl.empty();
   }
 };
-var ExposureModal = class extends import_obsidian2.Modal {
+
+// src/visuals/exposure-modal.ts
+var import_obsidian5 = require("obsidian");
+var ExposureModal = class extends import_obsidian5.Modal {
   constructor(app, info, actions) {
     super(app);
     this.info = info;
@@ -1392,30 +1441,30 @@ var ExposureModal = class extends import_obsidian2.Modal {
     contentEl.createEl("h2", { text: "Rhen Vault will not unlock here yet" });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: `These accounts can change the plugin files: ${this.info.writers.join(", ")}. A changed plugin could capture the passphrase, so Rhen Vault keeps the session locked. Locked notes are untouched and still encrypted.`
+      text: `These accounts can change the plugin files: ${this.info.writers.join(", ")}. A changed plugin could capture the secret, so Rhen Vault keeps the session locked. Locked notes are untouched and still encrypted.`
     });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Usual cause: a leftover sandbox or test account (for example CodexSandboxUsers) still has write access to the vault. Pick a fix, then choose Check again."
+      text: "Rhen Vault tried to remove their write access on the plugin folder, and they are still listed, so the session stays locked. Run the fix below yourself, or set up a separate Windows account."
     });
     if (this.info.fixCommands) {
-      new import_obsidian2.Setting(contentEl).setName("Remove their write access").setDesc("Run these in an elevated PowerShell or Command Prompt (right-click, Run as administrator). If the permission is inherited from a parent folder, run the same remove against that parent instead.").addButton(
+      new import_obsidian5.Setting(contentEl).setName("Remove their write access").setDesc("Paste this into PowerShell. It only changes the plugin folder. If Windows refuses, open PowerShell with Run as administrator and paste it again.").addButton(
         (button) => button.setButtonText("Copy fix").onClick(() => {
           void navigator.clipboard.writeText(this.info.fixCommands ?? "").then(
-            () => new import_obsidian2.Notice("Copied. Paste into an elevated prompt, then Check again."),
-            () => new import_obsidian2.Notice("Rhen Vault could not copy to the clipboard.")
+            () => new import_obsidian5.Notice("Copied. Paste it into PowerShell, then Check again."),
+            () => new import_obsidian5.Notice("Rhen Vault could not copy to the clipboard.")
           );
         })
       );
     }
-    new import_obsidian2.Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton(
+    new import_obsidian5.Setting(contentEl).addButton((button) => button.setButtonText("Close").onClick(() => this.close())).addButton(
       (button) => button.setButtonText("Check again").setCta().onClick(() => {
         this.close();
         this.actions.onRecheck();
       })
     );
     if (this.info.canProtect) {
-      new import_obsidian2.Setting(contentEl).setName("Strongest option").setDesc("Move the vault behind a separate Windows account instead, so your normal account and everything running in it lose access entirely.").addButton(
+      new import_obsidian5.Setting(contentEl).setName("Strongest option").setDesc("Move the vault behind a separate Windows account instead, so your normal account and everything running in it lose access entirely.").addButton(
         (button) => button.setButtonText("Set up separate account").onClick(() => {
           this.close();
           this.actions.onProtect();
@@ -1427,7 +1476,10 @@ var ExposureModal = class extends import_obsidian2.Modal {
     this.contentEl.empty();
   }
 };
-var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
+
+// src/visuals/settings-tab.ts
+var import_obsidian6 = require("obsidian");
+var RhenVaultSettingTab = class extends import_obsidian6.PluginSettingTab {
   controller;
   constructor(app, plugin) {
     super(app, plugin);
@@ -1436,7 +1488,7 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
   getSettingDefinitions() {
     const blocked = this.controller.agentBlockLabels();
     const locks = this.controller.settings.lockedFolders.length + this.controller.settings.lockedFiles.length;
-    const status = !this.controller.settings.verifier ? "Set a passphrase, then right-click a note or folder and choose Lock from AI." : this.controller.isUnlocked() ? `Session open. ${locks} lock ${locks === 1 ? "rule" : "rules"}. Locked notes stay encrypted on disk.` : "Session locked. Unlock to edit locked notes. They stay encrypted on disk.";
+    const status = !this.controller.settings.verifier ? "Choose a password or an image, then right-click a note or folder and choose Lock from AI." : this.controller.isUnlocked() ? `Session open. ${locks} lock ${locks === 1 ? "rule" : "rules"}. Locked notes stay encrypted on disk.` : "Session locked. Unlock to edit locked notes. They stay encrypted on disk.";
     const blockStatus = blocked.length ? `${blocked.join(", ")} is enabled. A read of a locked note from that plugin raises a block alert.` : "Right-click a note to lock it, or a folder to lock that folder and its subfolders.";
     return [
       {
@@ -1453,7 +1505,7 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
         render: (setting) => {
           if (!this.controller.settings.verifier) {
             setting.addButton(
-              (button) => button.setButtonText("Set passphrase").setCta().onClick(() => this.controller.openSetup())
+              (button) => button.setButtonText("Choose secret").setCta().onClick(() => this.controller.openSetup())
             );
           } else if (this.controller.isUnlocked()) {
             setting.addButton(
@@ -1471,7 +1523,7 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
       },
       {
         name: "Sealed extensions",
-        desc: "Comma-separated. Defaults to md, txt, canvas.",
+        desc: "Comma-separated text types. Defaults to md, txt, canvas. Images, PDFs, audio, and video inside a lock are sealed as well.",
         render: (setting) => {
           setting.addText(
             (text) => text.setValue(this.controller.settings.extensions.join(", ")).onChange(async (value) => {
@@ -1497,15 +1549,15 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
       },
       {
         name: "Seal locked notes",
-        desc: "Encrypt plaintext notes already covered by a lock. Already sealed notes are left as they are.",
+        desc: "Encrypt plaintext notes and media already covered by a lock. Already sealed files are left as they are.",
         render: (setting) => {
           setting.addButton(
             (button) => button.setButtonText("Seal locked notes").onClick(async () => {
               try {
                 const count = await this.controller.sealAll();
-                new import_obsidian2.Notice(count === 0 ? "No plaintext notes to seal." : `Sealed ${count} notes.`);
+                new import_obsidian6.Notice(count === 0 ? "No plaintext files to seal." : `Sealed ${count} ${count === 1 ? "file" : "files"}.`);
               } catch {
-                new import_obsidian2.Notice("Unlock Rhen Vault before sealing notes.");
+                new import_obsidian6.Notice("Unlock Rhen Vault before sealing notes.");
               }
             })
           );
@@ -1519,7 +1571,7 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
             (button) => button.setButtonText("Write shield files").onClick(async () => {
               const result = await this.controller.writeShields();
               const skipped = result.skipped.length ? ` Left ${result.skipped.join(", ")} unchanged.` : "";
-              new import_obsidian2.Notice(`Wrote ${result.written.length} shield files.${skipped}`);
+              new import_obsidian6.Notice(`Wrote ${result.written.length} shield files.${skipped}`);
             })
           );
         }
@@ -1532,9 +1584,9 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
             (button) => button.setButtonText("Copy").onClick(async () => {
               try {
                 await navigator.clipboard.writeText(this.controller.codexRules());
-                new import_obsidian2.Notice("Copied Codex deny rules.");
+                new import_obsidian6.Notice("Copied Codex deny rules.");
               } catch {
-                new import_obsidian2.Notice("Rhen Vault could not copy to the clipboard.");
+                new import_obsidian6.Notice("Rhen Vault could not copy to the clipboard.");
               }
             })
           );
@@ -1542,7 +1594,7 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
       },
       {
         name: "Recovery file",
-        desc: "Holds the salt and verifier, never the secret. Export it before uninstalling.",
+        desc: "Holds the salt and verifier, never the password or the picture. An image secret also stores the file name and size, so unlock can name the file. Export it before uninstalling.",
         visible: () => Boolean(this.controller.settings.verifier),
         render: (setting) => {
           setting.addButton(
@@ -1551,11 +1603,11 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
             (button) => button.setButtonText("Export").onClick(() => {
               const json = this.controller.exportRecovery();
               if (!json) {
-                new import_obsidian2.Notice("Rhen Vault has no secret to back up yet.");
+                new import_obsidian6.Notice("Rhen Vault has no secret to back up yet.");
                 return;
               }
               downloadTextFile("rhen-vault-recovery.json", json);
-              new import_obsidian2.Notice("Recovery file exported. Keep it somewhere safe.");
+              new import_obsidian6.Notice("Recovery file exported. Keep it somewhere safe.");
             })
           ).addButton(
             (button) => button.setButtonText("Import").onClick(() => {
@@ -1568,10 +1620,10 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
                 const file = input.files?.[0];
                 if (!file) return;
                 void file.text().then((text) => this.controller.importRecoveryFile(JSON.parse(text))).then((ok) => {
-                  new import_obsidian2.Notice(
+                  new import_obsidian6.Notice(
                     ok ? "Recovery file imported. Unlock with the original secret." : "That file is not a Rhen Vault recovery file."
                   );
-                }).catch(() => new import_obsidian2.Notice("Rhen Vault could not read that file."));
+                }).catch(() => new import_obsidian6.Notice("Rhen Vault could not read that file."));
               };
               input.click();
             })
@@ -1596,21 +1648,18 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
       },
       {
         name: "Plugin file protection",
-        desc: "Rhen Vault refuses to unlock while another account can rewrite the plugin files. Check who is listed and how to fix it.",
+        desc: "Before unlock, Rhen Vault removes other accounts' write access to this plugin folder. Unlock stays refused if any remain.",
         render: (setting) => {
           setting.addButton(
             (button) => button.setButtonText("Check now").onClick(() => {
-              void this.controller.checkPluginWriters().then((writers) => {
-                if (writers.length > 0) this.controller.showExposureInfo(writers);
-                else new import_obsidian2.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
-              });
+              void this.controller.fixPluginProtection();
             })
           );
         }
       },
       {
         name: "Unseal notes",
-        desc: "Writes note text back to disk as plaintext. Local agents will be able to read it.",
+        desc: "Writes locked notes and media back to disk as plaintext. Local AI agents will be able to read them.",
         render: (setting) => {
           setting.addButton(
             (button) => button.setButtonText("Unseal").setDestructive().onClick(() => {
@@ -1618,13 +1667,13 @@ var RhenVaultSettingTab = class extends import_obsidian2.PluginSettingTab {
                 this.app,
                 {
                   title: "Unseal notes?",
-                  body: "This writes note text back to disk as plaintext. Claudian, Cursor, Claude, and Codex will be able to read those files.",
+                  body: "This writes locked notes and media back to disk as plaintext. Local AI agents will be able to read them.",
                   confirm: "Unseal"
                 },
                 () => {
                   void this.controller.unsealAll().then(
-                    (count) => new import_obsidian2.Notice(`Unsealed ${count} notes.`),
-                    () => new import_obsidian2.Notice("Unlock Rhen Vault before unsealing notes.")
+                    (count) => new import_obsidian6.Notice(`Unsealed ${count} ${count === 1 ? "file" : "files"}.`),
+                    () => new import_obsidian6.Notice("Unlock Rhen Vault before unsealing notes.")
                   );
                 }
               ).open();
@@ -1748,9 +1797,100 @@ var FilesystemGuard = class {
   }
 };
 
-// src/vault/lock-actions.ts
-var import_obsidian3 = require("obsidian");
+// src/vault/image-guard.ts
 var import_fs3 = __toESM(require("fs"), 1);
+var import_obsidian7 = require("obsidian");
+var MAX_CHECK_BYTES = 64 * 1024 * 1024;
+function toBlob(raw) {
+  const bytes = new Uint8Array(raw.length);
+  bytes.set(raw);
+  return new Blob([bytes.buffer]);
+}
+var ImageGuard = class {
+  constructor(host) {
+    this.host = host;
+  }
+  warned = /* @__PURE__ */ new Set();
+  register() {
+    this.host.observe(this.host.app.vault.on("create", (file) => void this.check(file)));
+    this.host.observe(this.host.app.vault.on("rename", (file) => void this.check(file)));
+    this.host.observe(this.host.app.vault.on("modify", (file) => void this.check(file)));
+    this.host.observe(
+      this.host.app.vault.on("delete", (file) => {
+        if (file instanceof import_obsidian7.TFile) this.warned.delete(file.path);
+      })
+    );
+  }
+  async check(file) {
+    if (!(file instanceof import_obsidian7.TFile)) return;
+    if (!isSecretImagePath(file.path) || this.warned.has(file.path)) return;
+    const full = this.diskPath(file.path);
+    if (!full) return;
+    let match = false;
+    try {
+      match = await this.matchesSecretImage(full);
+    } catch (error) {
+      console.error("Rhen Vault: secret image check failed", error);
+      return;
+    }
+    if (!match) return;
+    this.warned.add(file.path);
+    this.host.confirmSecretImageRemoval(file);
+  }
+  /**
+   * True when the file at this absolute disk path holds the exact pixels of
+   * the setup image. Needs no session key: salt and verifier come from disk.
+   */
+  async matchesSecretImage(fullPath) {
+    const { salt, verifier, secretKind, kdfN, kdfR, kdfP } = this.host.settings;
+    if (secretKind !== "image" || !salt || !verifier) return false;
+    let raw;
+    try {
+      raw = await import_fs3.default.promises.readFile(fullPath);
+    } catch {
+      return false;
+    }
+    if (raw.length > MAX_CHECK_BYTES || isEnvelopeBytes(raw)) return false;
+    const saltBytes = Buffer.from(salt, "base64");
+    let candidate;
+    try {
+      candidate = (await secretFromBlob(toBlob(raw), saltBytes)).secret;
+    } catch {
+      return false;
+    }
+    const key = deriveKey(candidate, saltBytes, { N: kdfN, r: kdfR, p: kdfP });
+    try {
+      return verifierMatches(verifier, key);
+    } finally {
+      wipeKey(key);
+    }
+  }
+  /**
+   * Vault path of an existing image holding these setup pixels, for the
+   * setup refusal. Compares image secrets directly: no key exists yet, so
+   * there is no verifier and no scrypt run per file.
+   */
+  async scanSetupImage(secret, salt) {
+    const base = this.host.basePath();
+    if (!base) return null;
+    const paths = this.host.app.vault.getFiles().map((file) => file.path).filter(isSecretImagePath);
+    return findSecretImage(paths, async (vaultPath) => {
+      const full = safeJoin(base, vaultPath);
+      if (!full) return null;
+      const raw = await import_fs3.default.promises.readFile(full);
+      if (raw.length > MAX_CHECK_BYTES || isEnvelopeBytes(raw)) return null;
+      return (await secretFromBlob(toBlob(raw), salt)).secret;
+    }, secret);
+  }
+  diskPath(vaultPath) {
+    const base = this.host.basePath();
+    return base ? safeJoin(base, vaultPath) : null;
+  }
+};
+
+// src/vault/lock-actions.ts
+var import_obsidian8 = require("obsidian");
+var import_fs4 = __toESM(require("fs"), 1);
 var LockActions = class {
   constructor(host) {
     this.host = host;
@@ -1773,42 +1913,42 @@ var LockActions = class {
     );
   }
   addLockItems(menu, files) {
-    if (files.length === 1 && files[0] instanceof import_obsidian3.TFile && !isSealableExtension(files[0].path, this.host.state)) {
+    if (files.length === 1 && files[0] instanceof import_obsidian8.TFile && !isSealableExtension(files[0].path, this.host.state)) {
       return;
     }
     const locked = files.map((file) => this.itemIsLocked(file));
     if (locked.some((value) => !value)) {
       menu.addItem((item) => {
-        item.setTitle(files.length === 1 && files[0] instanceof import_obsidian3.TFolder ? "Lock folder from AI" : "Lock from AI").setIcon("shield").setSection("action").onClick(() => {
+        item.setTitle(files.length === 1 && files[0] instanceof import_obsidian8.TFolder ? "Lock folder from AI" : "Lock from AI").setIcon("shield").setSection("action").onClick(() => {
           void this.lockSelection(files);
         });
       });
     }
     if (locked.some(Boolean)) {
       menu.addItem((item) => {
-        item.setTitle(files.length === 1 && files[0] instanceof import_obsidian3.TFolder ? "Unlock folder from AI" : "Unlock from AI").setIcon("shield-off").setSection("action").onClick(() => {
+        item.setTitle(files.length === 1 && files[0] instanceof import_obsidian8.TFolder ? "Unlock folder from AI" : "Unlock from AI").setIcon("shield-off").setSection("action").onClick(() => {
           void this.unlockSelection(files);
         });
       });
     }
   }
   itemIsLocked(file) {
-    if (file instanceof import_obsidian3.TFolder) return folderIsLocked(file.path, this.host.rules());
+    if (file instanceof import_obsidian8.TFolder) return folderIsLocked(file.path, this.host.rules());
     return isLockedPath(file.path, this.host.rules());
   }
   async lockSelection(files) {
     let rules = this.host.rules();
     for (const file of files) {
-      rules = file instanceof import_obsidian3.TFolder ? lockFolder(rules, file.path) : lockFile(rules, file.path);
+      rules = file instanceof import_obsidian8.TFolder ? lockFolder(rules, file.path) : lockFile(rules, file.path);
     }
     this.host.commitRules(rules);
     await this.host.saveSettings();
-    const folder = files.length === 1 && files[0] instanceof import_obsidian3.TFolder;
+    const folder = files.length === 1 && files[0] instanceof import_obsidian8.TFolder;
     if (!this.host.state.key) {
       await this.host.syncHarnessGuards();
       await this.host.saveSettings();
-      new import_obsidian3.Notice(
-        folder ? "Folder locked. Right-click it again to unlock it. Notes are encrypted after you unlock Rhen Vault." : "Locked from AI. Right-click it again to unlock it. Notes are encrypted after you unlock Rhen Vault."
+      new import_obsidian8.Notice(
+        folder ? "Folder locked. Right-click it again to unlock it. Files inside it are encrypted after you unlock Rhen Vault." : "Locked from AI. Right-click it again to unlock it. The file is encrypted after you unlock Rhen Vault."
       );
       if (this.host.sessionBlocked()) this.host.confirmAccountProtection();
       return;
@@ -1816,43 +1956,43 @@ var LockActions = class {
     const sealed = (await this.rewrite(files, "seal")).opened;
     await this.host.syncHarnessGuards();
     await this.host.saveSettings();
-    new import_obsidian3.Notice(
-      sealed === 0 ? folder ? "Folder locked. Notes saved inside it are encrypted." : "Locked from AI." : `Locked ${sealed} ${sealed === 1 ? "note" : "notes"} from AI.`
+    new import_obsidian8.Notice(
+      sealed === 0 ? folder ? "Folder locked. Files saved inside it are encrypted." : "Locked from AI." : `Locked ${sealed} ${sealed === 1 ? "file" : "files"} from AI.`
     );
   }
   async unlockSelection(files) {
     if (!this.host.state.key) {
       if (await this.selectionHasEnvelope(files)) {
-        new import_obsidian3.Notice("Unlock Rhen Vault before changing locks. These notes are already encrypted.");
+        new import_obsidian8.Notice("Unlock Rhen Vault before changing locks. These notes are already encrypted.");
         this.host.openUnlockOrSetup();
         return;
       }
       let rules = this.host.rules();
       for (const file of files) {
-        rules = file instanceof import_obsidian3.TFolder ? unlockFolder(rules, file.path) : unlockFile(rules, file.path);
+        rules = file instanceof import_obsidian8.TFolder ? unlockFolder(rules, file.path) : unlockFile(rules, file.path);
       }
       this.host.commitRules(rules);
       await this.host.saveSettings();
       await this.host.syncHarnessGuards();
       await this.host.saveSettings();
-      const folder = files.length === 1 && files[0] instanceof import_obsidian3.TFolder;
-      new import_obsidian3.Notice(folder ? "Folder unlocked." : "Unlocked from AI.");
+      const folder = files.length === 1 && files[0] instanceof import_obsidian8.TFolder;
+      new import_obsidian8.Notice(folder ? "Folder unlocked." : "Unlocked from AI.");
       return;
     }
     const run = async () => {
       const key = this.host.state.key;
       if (!key) {
-        new import_obsidian3.Notice("Unlock Rhen Vault before changing locks.");
+        new import_obsidian8.Notice("Unlock Rhen Vault before changing locks.");
         return;
       }
       const damaged = await this.damagedEnvelopes(files, key);
       if (damaged.length > 0) {
         if (damaged.length === 1) {
-          new import_obsidian3.Notice(
+          new import_obsidian8.Notice(
             `Rhen Vault could not decrypt ${damaged[0]} with this secret. The lock stays on. Restore that note from backup.`
           );
         } else {
-          new import_obsidian3.Notice(
+          new import_obsidian8.Notice(
             `Rhen Vault could not decrypt ${damaged.length} notes with this secret. Locks stay on. Restore those notes from backup.`
           );
         }
@@ -1860,7 +2000,7 @@ var LockActions = class {
       }
       let rules = this.host.rules();
       for (const file of files) {
-        rules = file instanceof import_obsidian3.TFolder ? unlockFolder(rules, file.path) : unlockFile(rules, file.path);
+        rules = file instanceof import_obsidian8.TFolder ? unlockFolder(rules, file.path) : unlockFile(rules, file.path);
       }
       this.host.commitRules(rules);
       await this.host.saveSettings();
@@ -1868,15 +2008,15 @@ var LockActions = class {
       await this.host.syncHarnessGuards();
       await this.host.saveSettings();
       if (failed.length > 0) {
-        new import_obsidian3.Notice(
+        new import_obsidian8.Notice(
           `Rhen Vault unlocked the files but could not decrypt ${failed.length} of them with this secret. Restore ${failed.length === 1 ? "that note" : "those notes"} from backup.`
         );
         return;
       }
-      new import_obsidian3.Notice(`Unlocked ${opened} ${opened === 1 ? "note" : "notes"}. Agents can read them again.`);
+      new import_obsidian8.Notice(`Unlocked ${opened} ${opened === 1 ? "note" : "notes"}. Agents can read them again.`);
     };
-    const includesFolder = files.some((file) => file instanceof import_obsidian3.TFolder);
-    const exceptions = files.filter((file) => !(file instanceof import_obsidian3.TFolder) && unlockLeavesFolderLocked(this.host.rules(), file.path));
+    const includesFolder = files.some((file) => file instanceof import_obsidian8.TFolder);
+    const exceptions = files.filter((file) => !(file instanceof import_obsidian8.TFolder) && unlockLeavesFolderLocked(this.host.rules(), file.path));
     if (!includesFolder && exceptions.length > 0) {
       const one = exceptions.length === 1;
       this.confirmUnlock(
@@ -1896,7 +2036,7 @@ var LockActions = class {
     this.confirmUnlock(
       {
         title: "Unlock from AI?",
-        body: "This writes the selected notes back to disk as plaintext, including notes in subfolders. AI agents will be able to read them.",
+        body: "This writes the selected notes and media back to disk as plaintext, including files in subfolders. AI agents will be able to read them.",
         confirm: "Unlock"
       },
       run
@@ -1919,7 +2059,7 @@ var LockActions = class {
         if (!full) continue;
         let bytes;
         try {
-          bytes = await import_fs3.default.promises.readFile(full);
+          bytes = await import_fs4.default.promises.readFile(full);
         } catch {
           continue;
         }
@@ -1958,7 +2098,7 @@ var LockActions = class {
             const full = this.host.diskPath(file.path);
             if (full) {
               try {
-                const bytes = await import_fs3.default.promises.readFile(full);
+                const bytes = await import_fs4.default.promises.readFile(full);
                 if (isEnvelopeBytes(bytes)) failed.push(file.path);
               } catch {
               }
@@ -1990,7 +2130,7 @@ var LockActions = class {
    */
   followRename(file, oldPath) {
     const before = this.host.rules();
-    const after = renameLockPath(before, oldPath, file.path, file instanceof import_obsidian3.TFolder);
+    const after = renameLockPath(before, oldPath, file.path, file instanceof import_obsidian8.TFolder);
     const changed = JSON.stringify(before) !== JSON.stringify(after);
     if (changed) this.host.commitRules(after);
     const covered = this.collectFiles(file).some((item) => shouldSeal(item.path, this.host.state));
@@ -2002,7 +2142,7 @@ var LockActions = class {
       if (changed) await this.host.saveSettings();
       if (covered) {
         if (this.host.state.key) await this.rewrite([file], "seal");
-        else new import_obsidian3.Notice(`Rhen Vault: ${file.name} moved into a lock. Unlock Rhen Vault to encrypt it.`);
+        else new import_obsidian8.Notice(`Rhen Vault: ${file.name} moved into a lock. Unlock Rhen Vault to encrypt it.`);
       }
       if (changed) {
         await this.host.syncHarnessGuards();
@@ -2024,14 +2164,14 @@ var LockActions = class {
     return false;
   }
   collectFiles(file) {
-    if (file instanceof import_obsidian3.TFile) return [file];
-    if (file instanceof import_obsidian3.TFolder) return file.children.flatMap((child) => this.collectFiles(child));
+    if (file instanceof import_obsidian8.TFile) return [file];
+    if (file instanceof import_obsidian8.TFolder) return file.children.flatMap((child) => this.collectFiles(child));
     return [];
   }
 };
 
 // src/vault/media.ts
-var import_fs4 = __toESM(require("fs"), 1);
+var import_fs5 = __toESM(require("fs"), 1);
 var MediaStore = class {
   constructor(host) {
     this.host = host;
@@ -2052,11 +2192,11 @@ var MediaStore = class {
         if (detectAgent(new Error().stack ?? "", this.host.state.blockedPluginIds)) return original(vaultPath);
         const full = this.diskPath(vaultPath);
         if (!full) return original(vaultPath);
-        const mtime = import_fs4.default.statSync(full).mtimeMs;
+        const mtime = import_fs5.default.statSync(full).mtimeMs;
         const cached = this.host.blobUrls.get(vaultPath);
         if (cached?.mtime === mtime) return cached.url;
         this.forgetBlob(vaultPath);
-        const plain = openBytes(import_fs4.default.readFileSync(full), key);
+        const plain = openBytes(import_fs5.default.readFileSync(full), key);
         if (!plain) return original(vaultPath);
         const url = URL.createObjectURL(new Blob([plain], { type: attachmentMimeType(vaultPath) }));
         this.host.blobUrls.set(vaultPath, { url, mtime });
@@ -2088,7 +2228,7 @@ var MediaStore = class {
   async sealAttachment(vaultPath, key) {
     const full = this.diskPath(vaultPath);
     if (!full) return false;
-    const bytes = await import_fs4.default.promises.readFile(full);
+    const bytes = await import_fs5.default.promises.readFile(full);
     if (isEnvelopeBytes(bytes)) return false;
     await this.writeDisk(full, Buffer.from(encryptBytes(bytes, key), "utf8"));
     this.forgetBlob(vaultPath);
@@ -2098,7 +2238,7 @@ var MediaStore = class {
   async openAttachment(vaultPath, key) {
     const full = this.diskPath(vaultPath);
     if (!full) return false;
-    const plain = openBytes(await import_fs4.default.promises.readFile(full), key);
+    const plain = openBytes(await import_fs5.default.promises.readFile(full), key);
     if (!plain) return false;
     await this.writeDisk(full, plain);
     this.forgetBlob(vaultPath);
@@ -2108,8 +2248,8 @@ var MediaStore = class {
   async writeDisk(full, data) {
     this.host.sealingDisk = true;
     try {
-      if (typeof data === "string") await import_fs4.default.promises.writeFile(full, data, "utf8");
-      else await import_fs4.default.promises.writeFile(full, data);
+      if (typeof data === "string") await import_fs5.default.promises.writeFile(full, data, "utf8");
+      else await import_fs5.default.promises.writeFile(full, data);
     } finally {
       this.host.sealingDisk = false;
     }
@@ -2117,8 +2257,8 @@ var MediaStore = class {
 };
 
 // src/vault/watch.ts
-var import_fs5 = __toESM(require("fs"), 1);
-var import_obsidian4 = require("obsidian");
+var import_fs6 = __toESM(require("fs"), 1);
+var import_obsidian9 = require("obsidian");
 var OUTSIDE = "A program outside Obsidian";
 var GUARD_PATHS = new Set(
   [...IGNORE_FILES, CLAUDE_SETTINGS_PATH, OPENCODE_CONFIG_PATH, GROK_CONFIG_PATH, PI_PERMISSIONS_PATH].map(
@@ -2143,7 +2283,7 @@ var VaultWatch = class {
     );
   }
   async inspectOnDisk(file) {
-    if (!(file instanceof import_obsidian4.TFile) || !isSealableExtension(file.path, this.host.state)) return;
+    if (!(file instanceof import_obsidian9.TFile) || !isSealableExtension(file.path, this.host.state)) return;
     const installed = this.host.installed;
     if (!installed) return;
     if (this.host.inspecting.has(file.path)) {
@@ -2157,7 +2297,7 @@ var VaultWatch = class {
       if (isAttachmentPath(file.path)) {
         const full = this.host.diskPath(file.path);
         if (!full) return;
-        const bytes = await import_fs5.default.promises.readFile(full);
+        const bytes = await import_fs6.default.promises.readFile(full);
         envelope = isEnvelopeBytes(bytes);
         const next = resealBytes(file.path, bytes, this.host.state);
         if (next) {
@@ -2232,7 +2372,7 @@ var VaultWatch = class {
       this.scheduleGuardSync();
     }
     if (exposed > 0 && !this.host.state.key) {
-      new import_obsidian4.Notice(`Rhen Vault: ${exposed} locked ${exposed === 1 ? "note is" : "notes are"} not encrypted. Unlock Rhen Vault to seal them.`);
+      new import_obsidian9.Notice(`Rhen Vault: ${exposed} locked ${exposed === 1 ? "note is" : "notes are"} not encrypted. Unlock Rhen Vault to seal them.`);
     }
   }
   scheduleGuardSync() {
@@ -2243,7 +2383,7 @@ var VaultWatch = class {
         async (result) => {
           await this.host.saveSettings();
           if (result.files.length > 0) {
-            new import_obsidian4.Notice(`Rhen Vault restored ${result.files.length} AI guard ${result.files.length === 1 ? "file" : "files"}.`);
+            new import_obsidian9.Notice(`Rhen Vault restored ${result.files.length} AI guard ${result.files.length === 1 ? "file" : "files"}.`);
           }
         },
         (error) => console.error("Rhen Vault: guard sync failed", error)
@@ -2282,7 +2422,7 @@ var VaultWatch = class {
           continue;
         }
         if (isAttachmentPath(file.path)) {
-          const bytes = await import_fs5.default.promises.readFile(full);
+          const bytes = await import_fs6.default.promises.readFile(full);
           const sealed2 = resealBytes(file.path, bytes, this.host.state);
           if (!sealed2) continue;
           await this.host.writeDisk(full, sealed2);
@@ -2292,7 +2432,7 @@ var VaultWatch = class {
           resealed = true;
           continue;
         }
-        const raw = await import_fs5.default.promises.readFile(full, "utf8");
+        const raw = await import_fs6.default.promises.readFile(full, "utf8");
         const sealed = resealPlaintext(file.path, raw, this.host.state);
         if (!sealed) continue;
         await this.host.writeDisk(full, sealed);
@@ -2316,13 +2456,15 @@ function asIdentity(value) {
   if (typeof item.salt !== "string" || typeof item.verifier !== "string") return null;
   if (typeof item.kdfN !== "number" || typeof item.kdfR !== "number" || typeof item.kdfP !== "number") return null;
   const secretKind = item.secretKind === "image" ? item.secretKind : void 0;
+  const imageHint = asImageHint(item.imageHint);
   return {
     salt: item.salt,
     verifier: item.verifier,
     kdfN: item.kdfN,
     kdfR: item.kdfR,
     kdfP: item.kdfP,
-    ...secretKind ? { secretKind } : {}
+    ...secretKind ? { secretKind } : {},
+    ...imageHint ? { imageHint } : {}
   };
 }
 
@@ -2362,13 +2504,34 @@ function foreignWriters(entries, allowedIdentities) {
   }
   return found;
 }
+function pluginFolderTarget(target) {
+  const folder = target.replace(/\//g, "\\").replace(/[\\]+$/, "");
+  if (folder.includes("..") || /[\r\n\0"]/.test(folder)) throw new Error("Unsupported plugin folder.");
+  if (!/^[A-Za-z]:\\[^\\].+/.test(folder)) throw new Error("Unsupported plugin folder.");
+  return folder;
+}
+function writerName(writer) {
+  const id = writer.trim();
+  if (!id || /[\r\n\0]/.test(id)) throw new Error("Unsupported account name.");
+  return id;
+}
+function clearWritersScript(target, writers) {
+  const folder = pluginFolderTarget(target);
+  const names = writers.map(writerName);
+  if (names.length === 0) throw new Error("No accounts to remove.");
+  const quote2 = (value) => `'${value.replace(/'/g, "''")}'`;
+  return [
+    `$Folder = ${quote2(folder)}`,
+    `$Writers = @(${names.map(quote2).join(", ")})`,
+    `$Access = [System.Security.AccessControl.AccessControlSections]::Access`,
+    `$SidType = [System.Security.Principal.SecurityIdentifier]`,
+    `$Sids = @(foreach ($w in $Writers) { if ($w -match '^S-\\d+(-\\d+)+$') { $w } else { try { ([System.Security.Principal.NTAccount]$w).Translate($SidType).Value } catch { Write-Host "Rhen Vault: could not resolve $w" } } })`,
+    `try { $root = Get-Item -LiteralPath $Folder -Force -ErrorAction Stop; $acl = $root.GetAccessControl($Access); $acl.SetAccessRuleProtection($true, $true); $root.SetAccessControl($acl) } catch { Write-Host "Rhen Vault: could not stop inheritance on $Folder. $($_.Exception.Message)" }`,
+    `foreach ($item in @(Get-Item -LiteralPath $Folder -Force) + @(Get-ChildItem -LiteralPath $Folder -Recurse -Force)) { try { $acl = $item.GetAccessControl($Access); $changed = $false; foreach ($rule in @($acl.GetAccessRules($true, $false, $SidType))) { if ($rule.AccessControlType -eq 'Allow' -and $Sids -contains $rule.IdentityReference.Value) { [void]$acl.RemoveAccessRuleSpecific($rule); $changed = $true } }; if ($changed) { $item.SetAccessControl($acl) } } catch { Write-Host "Rhen Vault: could not update $($item.FullName). $($_.Exception.Message)" } }`
+  ].join("\n");
+}
 function removalCommands(target, writers) {
-  const quoted = `"${target}"`;
-  return writers.map((writer) => {
-    const id = writer.trim();
-    const principal = /^S-\d+(-\d+)+$/.test(id) ? `"*${id}"` : `"${id}"`;
-    return `icacls ${quoted} /remove ${principal}`;
-  }).join("\n");
+  return clearWritersScript(target, writers);
 }
 
 // src/windows/account.ts
@@ -2526,9 +2689,17 @@ function undoScript(protectedPath, account = ACCOUNT_NAME, root = PROTECTED_ROOT
     `}`
   ].join("\n");
 }
-function elevatedLaunchArgs(script) {
+function inlineLaunchArgs(script) {
   const encoded = Buffer.from(script, "utf16le").toString("base64");
-  const command = `Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${encoded}'`;
+  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", encoded];
+  if (args.join(" ").length > MAX_COMMAND_LINE) throw new Error("Script is too long for a Windows command line.");
+  return args;
+}
+function elevatedLaunchArgs(script, options) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const wait = options?.wait ? " -Wait" : "";
+  const hidden = options?.wait ? ",'-WindowStyle','Hidden'" : "";
+  const command = `Start-Process -FilePath powershell.exe -Verb RunAs${wait} -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass'${hidden},'-EncodedCommand','${encoded}'`;
   if (command.length > MAX_COMMAND_LINE) throw new Error("Setup script is too long for a Windows command line.");
   return ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", command];
 }
@@ -2541,7 +2712,7 @@ var LEGACY_LOCK_RECORD_STORAGE = "slate-infosec-lock-record";
 var LEGACY_IDENTITY_STORAGE = "slate-infosec-identity";
 var LEGACY_RECOVERY_MARK = "slate-infosec-v1";
 var LEGACY_PLUGIN_ID = "slate-infosec";
-var RhenVaultPlugin = class extends import_obsidian5.Plugin {
+var RhenVaultPlugin = class extends import_obsidian10.Plugin {
   settings = mergeSettings(null);
   state = {
     key: null,
@@ -2561,6 +2732,12 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
   adapterDepth = 0;
   sealingDisk = false;
   protectionStarted = false;
+  unlockFlow = null;
+  writerClear = null;
+  shutdownGate = null;
+  shutdownAllowed = false;
+  enableStamp = 0;
+  restorePluginHooks = null;
   sweeping = false;
   exposedNotice = /* @__PURE__ */ new Set();
   userPlaintext = /* @__PURE__ */ new Set();
@@ -2574,6 +2751,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
   guardSyncTimer = null;
   media = new MediaStore(this);
   watch = new VaultWatch(this);
+  imageGuard = new ImageGuard(this);
   filesystem = new FilesystemGuard(this);
   lockActions = new LockActions(this);
   guards = new GuardSync(this);
@@ -2584,7 +2762,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       if (legacy) {
         loaded = legacy;
         await this.saveData(legacy);
-        new import_obsidian5.Notice("Rhen Vault imported settings from the former Slate plugin.");
+        new import_obsidian10.Notice("Rhen Vault imported settings from the former Slate plugin.");
       }
     }
     this.settings = mergeSettings(loaded);
@@ -2621,7 +2799,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     this.registerFileMenus();
     this.registerWatchers();
     this.addRibbonIcon("lock", "Rhen Vault", () => {
-      if (this.state.key) this.lock();
+      if (this.state.key) this.confirmLockSession();
       else this.openUnlockOrSetup();
     });
     this.statusEl = this.addStatusBarItem();
@@ -2635,18 +2813,21 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     this.renderStatus();
     this.disableFileRecovery();
     void this.syncHarnessGuards().then(() => this.saveSettings()).catch(() => void 0);
+    this.installShutdownPrompt();
     this.app.workspace.onLayoutReady(() => this.beginForThisComputer());
   }
   /** Runs after the vault path exists. Opens setup or unlock. Signed-in and signed-out Obsidian users take the same path. */
   beginForThisComputer() {
     if (!this.settings.verifier) {
-      new import_obsidian5.Notice("Rhen Vault is on. Set a passphrase, then right-click a note or folder and choose Lock from AI.");
+      new import_obsidian10.Notice("Rhen Vault is on. Choose a password or an image, then right-click a note or folder and choose Lock from AI.");
       this.openSetup();
     } else if (!this.isUnlocked()) {
       this.openUnlock();
     }
   }
   onunload() {
+    this.restorePluginHooks?.();
+    this.restorePluginHooks = null;
     if (this.guardSyncTimer !== null) window.clearTimeout(this.guardSyncTimer);
     this.flushOpenEditorsToDisk();
     wipeKey(this.state.key);
@@ -2676,18 +2857,9 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       this.confirmAccountProtection();
       return;
     }
-    void this.foreignPluginWriters().then((writers) => {
-      if (writers.length > 0) {
-        this.refuseExposed(
-          `Rhen Vault will not unlock. ${writers.join(", ")} can change this plugin and capture the passphrase. Open Settings \u2192 Rhen Vault \u2192 Plugin file protection to fix it.`
-        );
-        this.showExposureInfo(writers);
-        return;
-      }
-      const salt = this.settings.salt ? new Uint8Array(Buffer.from(this.settings.salt, "base64")) : null;
-      new UnlockModal(this.app, this.settings.secretKind, this.basePath(), salt, (secret) => {
-        if (this.unlock(secret)) new import_obsidian5.Notice("Rhen Vault unlocked. Locked notes stay encrypted on disk.");
-      }).open();
+    if (this.unlockFlow) return;
+    this.unlockFlow = this.prepareUnlock().finally(() => {
+      this.unlockFlow = null;
     });
   }
   openUnlockOrSetup() {
@@ -2705,6 +2877,173 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     this.revokeBlobUrls();
     void this.refreshOpenNotes();
     this.renderStatus();
+  }
+  /**
+   * Settings turns the plugin off through disable or uninstall. Ask for the
+   * password or image first. Closing the dialog leaves Rhen Vault enabled.
+   * The dialog does not name the image file.
+   */
+  installShutdownPrompt() {
+    const plugins = this.app.plugins;
+    if (!plugins?.disablePlugin && !plugins?.disablePluginAndSave && !plugins?.uninstallPlugin) return;
+    const original = {
+      disablePlugin: plugins.disablePlugin,
+      disablePluginAndSave: plugins.disablePluginAndSave,
+      uninstallPlugin: plugins.uninstallPlugin
+    };
+    const host = this;
+    const gate = async (id, run) => {
+      if (!run) return;
+      if (id !== host.manifest.id) return run.call(plugins, id);
+      host.markEnabled();
+      if (!await host.allowShutdown()) {
+        await host.keepEnabled();
+        return false;
+      }
+      return run.call(plugins, id);
+    };
+    if (original.disablePlugin) plugins.disablePlugin = (id) => gate(id, original.disablePlugin);
+    if (original.disablePluginAndSave) plugins.disablePluginAndSave = (id) => gate(id, original.disablePluginAndSave);
+    if (original.uninstallPlugin) plugins.uninstallPlugin = (id) => gate(id, original.uninstallPlugin);
+    this.restorePluginHooks = () => {
+      plugins.disablePlugin = original.disablePlugin;
+      plugins.disablePluginAndSave = original.disablePluginAndSave;
+      plugins.uninstallPlugin = original.uninstallPlugin;
+    };
+  }
+  /** Put this plugin back on the enabled list before Obsidian saves that list. */
+  markEnabled() {
+    const plugins = this.app.plugins;
+    plugins?.enabledPlugins?.add?.(this.manifest.id);
+  }
+  /**
+   * Closing the dialog leaves the settings switch off and the saved list
+   * already missing this plugin. Put both back, and load the plugin again
+   * if Obsidian had already unloaded it.
+   */
+  async keepEnabled() {
+    const stamp = ++this.enableStamp;
+    const plugins = this.app.plugins;
+    const id = this.manifest.id;
+    this.markEnabled();
+    if (plugins && !plugins.plugins?.[id] && plugins.enablePlugin) {
+      try {
+        await plugins.enablePlugin(id);
+      } catch (error) {
+        console.error("Rhen Vault: could not stay enabled", error);
+      }
+    }
+    this.markEnabled();
+    await this.saveEnabledPlugins();
+    this.showPluginEnabled();
+    new import_obsidian10.Notice("Rhen Vault stays on.");
+    window.setTimeout(() => {
+      if (stamp !== this.enableStamp || this.shutdownAllowed) return;
+      this.markEnabled();
+      void this.saveEnabledPlugins();
+      this.showPluginEnabled();
+    }, 1e3);
+  }
+  async saveEnabledPlugins() {
+    const plugins = this.app.plugins;
+    try {
+      if (plugins?.requestSaveConfig) await plugins.requestSaveConfig();
+      else if (plugins?.saveConfig) await plugins.saveConfig();
+    } catch (error) {
+      console.error("Rhen Vault: could not save the enabled plugin list", error);
+    }
+    try {
+      await this.writeEnabledPlugins();
+    } catch (error) {
+      console.error("Rhen Vault: could not write the enabled plugin list", error);
+    }
+  }
+  async writeEnabledPlugins() {
+    const plugins = this.app.plugins;
+    const ids = new Set(plugins?.enabledPlugins ? plugins.enabledPlugins : []);
+    ids.add(this.manifest.id);
+    await this.app.vault.adapter.write(
+      `${this.app.vault.configDir}/community-plugins.json`,
+      `${JSON.stringify([...ids], null, 2)}
+`
+    );
+  }
+  /** The community-plugins switch does not flip back on by itself. */
+  showPluginEnabled() {
+    const name = this.manifest.name;
+    const items = document.querySelectorAll(".setting-item");
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const title = item.querySelector(".setting-item-name");
+      if (title?.textContent?.trim() !== name) continue;
+      const input = item.querySelector('input[type="checkbox"]');
+      if (input instanceof HTMLInputElement) input.checked = true;
+      item.querySelector(".checkbox-container")?.classList.add("is-enabled");
+    }
+  }
+  /** True only after the secret matches. A closed dialog stays false. */
+  allowShutdown() {
+    if (!this.settings.verifier) return Promise.resolve(true);
+    if (this.shutdownAllowed) return Promise.resolve(true);
+    if (!this.shutdownGate) {
+      this.shutdownGate = this.promptForShutdown().finally(() => {
+        this.shutdownGate = null;
+      });
+    }
+    return this.shutdownGate;
+  }
+  async promptForShutdown() {
+    const writers = await this.foreignPluginWriters();
+    if (writers.length > 0) await this.clearForeignPluginWriters(writers);
+    const remaining = await this.foreignPluginWriters();
+    if (remaining.length > 0) {
+      this.showExposureInfo(remaining);
+      new import_obsidian10.Notice("Rhen Vault stays on. It will not ask for the secret while another account can change the plugin files.");
+      return false;
+    }
+    const salt = this.settings.salt ? new Uint8Array(Buffer.from(this.settings.salt, "base64")) : null;
+    return new Promise((resolve2) => {
+      let settled = false;
+      let accepted = false;
+      const finish = (turnOff) => {
+        if (settled) return;
+        settled = true;
+        if (turnOff) this.shutdownAllowed = true;
+        resolve2(turnOff);
+      };
+      new UnlockModal(
+        this.app,
+        this.settings.secretKind,
+        this.basePath(),
+        salt,
+        (secret) => {
+          if (!this.acceptsSecret(secret)) return false;
+          accepted = true;
+          return true;
+        },
+        null,
+        {
+          title: "Turn off Rhen Vault",
+          intro: "Enter your password or choose your image to turn the plugin off. Closing this leaves it enabled. Locked notes stay encrypted.",
+          confirm: "Turn off",
+          showHint: false,
+          onDismiss: () => finish(accepted)
+        }
+      ).open();
+    });
+  }
+  /** The ribbon lock closes the session. Confirm that before the notes turn into ciphertext on screen. */
+  confirmLockSession() {
+    const locked = this.settings.lockedFolders.length + this.settings.lockedFiles.length;
+    new ConfirmModal(
+      this.app,
+      {
+        title: "Lock the Rhen Vault session?",
+        body: locked > 0 ? "Obsidian will show locked notes as ciphertext. They stay encrypted on disk. Click the lock again and choose the same image or password to open the session. That shows the notes again. It does not write them back as plaintext." : "This closes the session. Nothing is locked yet, so nothing new is encrypted. Right-click a note or folder and choose Lock from AI to encrypt it. Click the lock again and choose your image or password to open the session.",
+        confirm: "Lock session"
+      },
+      () => this.lock()
+    ).open();
   }
   async sealAll() {
     this.requireKey();
@@ -2734,7 +3073,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       if (isAttachmentPath(file.path)) {
         const full = this.diskPath(file.path);
         if (!full) continue;
-        const bytes = await import_fs6.default.promises.readFile(full);
+        const bytes = await import_fs7.default.promises.readFile(full);
         if (!isEnvelopeBytes(bytes)) continue;
         const plain2 = openBytes(bytes, this.state.key);
         if (plain2 === null) throw new Error("decrypt failed");
@@ -2838,8 +3177,8 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       name: "Seal unsealed notes",
       callback: () => {
         void this.sealAll().then(
-          (count) => new import_obsidian5.Notice(count === 0 ? "No plaintext notes to seal." : `Sealed ${count} notes.`),
-          () => new import_obsidian5.Notice("Unlock Rhen Vault before sealing notes.")
+          (count) => new import_obsidian10.Notice(count === 0 ? "No plaintext files to seal." : `Sealed ${count} ${count === 1 ? "file" : "files"}.`),
+          () => new import_obsidian10.Notice("Unlock Rhen Vault before sealing notes.")
         );
       }
     });
@@ -2848,7 +3187,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       name: "Write agent shield files",
       callback: () => {
         void this.writeShields().then((result) => {
-          new import_obsidian5.Notice(`Wrote ${result.written.length} shield files.`);
+          new import_obsidian10.Notice(`Wrote ${result.written.length} shield files.`);
         });
       }
     });
@@ -2859,11 +3198,11 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
         void this.syncHarnessGuards().then(
           (result) => {
             void this.saveSettings();
-            new import_obsidian5.Notice(
+            new import_obsidian10.Notice(
               result.files.length === 0 ? "Guard files match the lock list." : `Synced ${result.files.length} guard files.`
             );
           },
-          () => new import_obsidian5.Notice("Rhen Vault could not sync guard files.")
+          () => new import_obsidian10.Notice("Rhen Vault could not sync guard files.")
         );
       }
     });
@@ -2872,8 +3211,8 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       name: "Copy Codex deny rules for locked notes",
       callback: () => {
         void navigator.clipboard.writeText(this.codexRules()).then(
-          () => new import_obsidian5.Notice("Copied. Paste into ~/.codex/config.toml under your profile's filesystem table."),
-          () => new import_obsidian5.Notice("Rhen Vault could not copy to the clipboard.")
+          () => new import_obsidian10.Notice("Copied. Paste into ~/.codex/config.toml under your profile's filesystem table."),
+          () => new import_obsidian10.Notice("Rhen Vault could not copy to the clipboard.")
         );
       }
     });
@@ -2904,10 +3243,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       id: "check-protection",
       name: "Check plugin file protection",
       callback: () => {
-        void this.checkPluginWriters().then((writers) => {
-          if (writers.length > 0) this.showExposureInfo(writers);
-          else new import_obsidian5.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
-        });
+        void this.fixPluginProtection();
       }
     });
     this.addCommand({
@@ -2918,13 +3254,13 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
           this.app,
           {
             title: "Unseal notes?",
-            body: "This writes note text back to disk as plaintext. Local AI agents will be able to read them.",
+            body: "This writes locked notes and media back to disk as plaintext. Local AI agents will be able to read them.",
             confirm: "Unseal"
           },
           () => {
             void this.unsealAll().then(
-              (count) => new import_obsidian5.Notice(`Unsealed ${count} notes.`),
-              () => new import_obsidian5.Notice("Unlock Rhen Vault before unsealing notes.")
+              (count) => new import_obsidian10.Notice(`Unsealed ${count} ${count === 1 ? "file" : "files"}.`),
+              () => new import_obsidian10.Notice("Unlock Rhen Vault before unsealing notes.")
             );
           }
         ).open();
@@ -2933,10 +3269,17 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
   }
   async setup(choice) {
     if (this.settings.verifier) {
-      new import_obsidian5.Notice("This vault already has a Rhen Vault secret.");
+      new import_obsidian10.Notice("This vault already has a Rhen Vault secret.");
       return;
     }
     const salt = Buffer.from(choice.salt ?? crypto.getRandomValues(new Uint8Array(16)));
+    if (choice.kind === "image") {
+      const clash = await this.imageGuard.scanSetupImage(choice.secret, salt);
+      if (clash) {
+        new import_obsidian10.Notice(`Rhen Vault: that picture cannot be used. It already exists in this vault at ${clash}. Remove it or choose a different image.`);
+        return;
+      }
+    }
     const key = deriveKey(choice.secret, salt, {
       N: this.settings.kdfN,
       r: this.settings.kdfR,
@@ -2945,6 +3288,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     this.settings.salt = salt.toString("base64");
     this.settings.verifier = createVerifier(key);
     this.settings.secretKind = choice.kind;
+    this.settings.imageHint = choice.kind === "image" ? choice.imageHint ?? null : null;
     this.state.key = key;
     await this.saveSettings();
     if (choice.shields) await this.writeShields();
@@ -2953,7 +3297,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       this.confirmAccountProtection();
       return;
     }
-    new import_obsidian5.Notice("Rhen Vault secret saved. Right-click a note or folder and choose Lock from AI.");
+    new import_obsidian10.Notice("Rhen Vault secret saved. Right-click a note or folder and choose Lock from AI.");
     this.renderStatus();
     this.maybeShowRecoveryNotice();
   }
@@ -2974,7 +3318,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       }
       if (identity !== current) {
         Object.assign(this.settings, identity);
-        new import_obsidian5.Notice("Rhen Vault's passphrase settings were changed outside Obsidian. Rhen Vault restored them from its backup.");
+        new import_obsidian10.Notice("Rhen Vault's secret settings were changed outside Obsidian. Rhen Vault restored them from its backup.");
       }
       if (this.sessionBlocked()) {
         wipeKey(key);
@@ -2989,7 +3333,26 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       this.maybeShowRecoveryNotice();
       return true;
     }
-    new import_obsidian5.Notice("Wrong passphrase.");
+    new import_obsidian10.Notice(this.settings.secretKind === "image" ? "That image does not match." : "Wrong passphrase.");
+    return false;
+  }
+  /** True when the password or image matches. Does not open the session. */
+  acceptsSecret(passphrase) {
+    const current = this.identity();
+    const backup = asIdentity(this.app.loadLocalStorage(IDENTITY_STORAGE)) ?? asIdentity(this.app.loadLocalStorage(LEGACY_IDENTITY_STORAGE));
+    const candidates = [current, backup && backup.salt !== current?.salt ? backup : null];
+    for (const identity of candidates) {
+      if (!identity) continue;
+      const key = deriveKey(passphrase, Buffer.from(identity.salt, "base64"), {
+        N: identity.kdfN,
+        r: identity.kdfR,
+        p: identity.kdfP
+      });
+      const matches = verifierMatches(identity.verifier, key);
+      wipeKey(key);
+      if (matches) return true;
+    }
+    new import_obsidian10.Notice(this.settings.secretKind === "image" ? "That image does not match." : "Wrong passphrase.");
     return false;
   }
   /**
@@ -3022,18 +3385,18 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     }
     await this.saveSettings();
     if (tampered) {
-      new import_obsidian5.Notice("Rhen Vault's lock list was changed outside Obsidian. Rhen Vault restored its locks.");
+      new import_obsidian10.Notice("Rhen Vault's lock list was changed outside Obsidian. Rhen Vault restored its locks.");
       await this.syncHarnessGuards();
       await this.saveSettings();
     }
     const count = await this.sealAll();
     if (count > 0) {
-      new import_obsidian5.Notice(`Rhen Vault encrypted ${count} locked ${count === 1 ? "note that was" : "notes that were"} still plaintext.`);
+      new import_obsidian10.Notice(`Rhen Vault encrypted ${count} locked ${count === 1 ? "file that was" : "files that were"} still plaintext.`);
     }
     const unreadable = await this.scanUnreadableLocked();
     if (unreadable > 0) {
-      new import_obsidian5.Notice(
-        unreadable === 1 ? "One locked note cannot be decrypted with this secret. It may be damaged or sealed under a different secret. The lock stays on. Restore that note from backup." : `${unreadable} locked notes cannot be decrypted with this secret. Locks stay on. Restore those notes from backup.`
+      new import_obsidian10.Notice(
+        unreadable === 1 ? "One locked file cannot be decrypted with this secret. It may be damaged or sealed under a different secret. The lock stays on. Restore that file from backup." : `${unreadable} locked files cannot be decrypted with this secret. Locks stay on. Restore those files from backup.`
       );
     }
   }
@@ -3065,7 +3428,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     await this.saveSettings();
     this.scheduleGuardSync();
     if (merged.tampered || identityChanged) {
-      new import_obsidian5.Notice("Rhen Vault's settings were changed outside Obsidian. Rhen Vault kept its locks.");
+      new import_obsidian10.Notice("Rhen Vault's settings were changed outside Obsidian. Rhen Vault kept its locks.");
     }
   }
   /**
@@ -3104,8 +3467,8 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     }
   }
   identity() {
-    const { salt, verifier, kdfN, kdfR, kdfP, secretKind } = this.settings;
-    return salt && verifier ? { salt, verifier, kdfN, kdfR, kdfP, secretKind } : null;
+    const { salt, verifier, kdfN, kdfR, kdfP, secretKind, imageHint } = this.settings;
+    return salt && verifier ? { salt, verifier, kdfN, kdfR, kdfP, secretKind, ...imageHint ? { imageHint } : {} } : null;
   }
   /**
    * Locked files whose envelopes the session key cannot open. Text reads go
@@ -3123,7 +3486,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
         if (isAttachmentPath(file.path)) {
           const full = this.diskPath(file.path);
           if (!full) continue;
-          const bytes = await import_fs6.default.promises.readFile(full);
+          const bytes = await import_fs7.default.promises.readFile(full);
           if (isEnvelopeBytes(bytes) && openBytes(bytes, key) === null) count += 1;
         } else {
           const raw = await installed.read(file.path);
@@ -3182,7 +3545,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     if (!installed) return;
     const views = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
-      if (leaf.view instanceof import_obsidian5.MarkdownView && leaf.view.file) views.push(leaf.view);
+      if (leaf.view instanceof import_obsidian10.MarkdownView && leaf.view.file) views.push(leaf.view);
     });
     const unreadable = [];
     for (const view of views) {
@@ -3205,33 +3568,33 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     if (!base || !key) return;
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
-      if (!(view instanceof import_obsidian5.MarkdownView) || !view.file || !view.editor) return;
+      if (!(view instanceof import_obsidian10.MarkdownView) || !view.file || !view.editor) return;
       if (!shouldSeal(view.file.path, this.state)) return;
       const current = view.editor.getValue();
       if (isEnvelope(current) && decryptWithKey(current, key) === null) return;
       const sealed = isEnvelope(current) ? current : encryptWithKey(current, key);
       const full = safeJoin(base, view.file.path);
       if (!full) return;
-      import_fs6.default.writeFileSync(full, sealed, { encoding: "utf8" });
+      import_fs7.default.writeFileSync(full, sealed, { encoding: "utf8" });
       view.setViewData(sealed, true);
     });
   }
   basePath() {
     const adapter = this.app.vault.adapter;
-    if (adapter instanceof import_obsidian5.FileSystemAdapter) return adapter.getBasePath();
+    if (adapter instanceof import_obsidian10.FileSystemAdapter) return adapter.getBasePath();
     return null;
   }
   noticeLocked() {
     const now = Date.now();
     if (now - this.lastLockedNotice < 3e3) return;
     this.lastLockedNotice = now;
-    new import_obsidian5.Notice("Unlock Rhen Vault before editing a locked note.");
+    new import_obsidian10.Notice("Unlock Rhen Vault before editing a locked note.");
   }
   noticeCorruptSave(filePath) {
     const now = Date.now();
     if (now - this.lastCorruptNotice < 1e4) return;
     this.lastCorruptNotice = now;
-    new import_obsidian5.Notice(
+    new import_obsidian10.Notice(
       `Rhen Vault refused to save ${filePath}: its envelope cannot be opened with this secret. Restore that note from backup.`
     );
   }
@@ -3239,7 +3602,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     const now = Date.now();
     if (now - this.lastDecryptNotice < 1e4) return;
     this.lastDecryptNotice = now;
-    new import_obsidian5.Notice(
+    new import_obsidian10.Notice(
       paths.length === 1 ? `Rhen Vault could not decrypt ${paths[0]} with this secret. It may be damaged or sealed under a different secret. The lock stays on.` : `Rhen Vault could not decrypt ${paths.length} locked notes with this secret. Locks stay on. Restore those notes from backup.`
     );
   }
@@ -3251,14 +3614,13 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     this.state.key = null;
     void this.refreshOpenNotes();
     this.renderStatus();
-    new import_obsidian5.Notice(message);
+    new import_obsidian10.Notice(message);
   }
+  /** Accounts, other than you and Windows itself, that can rewrite the plugin. Empty when the check cannot run. */
   foreignPluginWriters() {
     if (process.platform !== "win32") return Promise.resolve([]);
-    const base = this.basePath();
-    if (!base) return Promise.resolve([]);
-    const pluginDir = path2.join(base, this.app.vault.configDir, "plugins", this.manifest.id);
-    const target = import_fs6.default.existsSync(pluginDir) ? pluginDir : base;
+    const target = this.pluginTargetPath();
+    if (!target) return Promise.resolve([]);
     const user = [process.env.USERDOMAIN, process.env.USERNAME].filter(Boolean).join("\\");
     return new Promise((resolve2) => {
       (0, import_child_process.execFile)("icacls", [target], { windowsHide: true, timeout: 8e3 }, (error, stdout) => {
@@ -3271,26 +3633,162 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
       });
     });
   }
-  /** Accounts, other than you and Windows itself, that can rewrite the plugin. Empty when the check cannot run. */
-  checkPluginWriters() {
-    return this.foreignPluginWriters();
+  /**
+   * Drop foreign write access on the plugin folder, then report what remains.
+   * Settings and the command palette use this. Unlock uses the same clear.
+   */
+  async fixPluginProtection() {
+    const writers = await this.foreignPluginWriters();
+    if (writers.length === 0) {
+      new import_obsidian10.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
+      return;
+    }
+    await this.clearForeignPluginWriters(writers);
+    const remaining = await this.foreignPluginWriters();
+    if (remaining.length === 0) {
+      new import_obsidian10.Notice("Only you, SYSTEM, and administrators can change the plugin files.");
+      return;
+    }
+    this.showExposureInfo(remaining);
   }
-  /** Folder the permission check reads, for the copyable fix. Null when the vault path is unknown. */
-  pluginTargetPath() {
+  async prepareUnlock() {
+    const writers = await this.foreignPluginWriters();
+    if (writers.length > 0) await this.clearForeignPluginWriters(writers);
+    const remaining = await this.foreignPluginWriters();
+    if (remaining.length > 0) {
+      this.refuseExposed(
+        `Rhen Vault will not unlock. ${remaining.join(", ")} can change this plugin and capture the secret. Open Settings \u2192 Rhen Vault \u2192 Plugin file protection to fix it.`
+      );
+      this.showExposureInfo(remaining);
+      return;
+    }
+    if (writers.length > 0) new import_obsidian10.Notice("Other accounts can no longer change the plugin files.");
+    this.openPassphrasePrompt();
+  }
+  openPassphrasePrompt() {
+    const salt = this.settings.salt ? new Uint8Array(Buffer.from(this.settings.salt, "base64")) : null;
+    new UnlockModal(this.app, this.settings.secretKind, this.basePath(), salt, (secret) => {
+      void this.foreignPluginWriters().then((writers) => {
+        if (writers.length > 0) {
+          this.refuseExposed(
+            `Rhen Vault will not unlock. ${writers.join(", ")} can change this plugin and capture the secret. Open Settings \u2192 Rhen Vault \u2192 Plugin file protection to fix it.`
+          );
+          this.showExposureInfo(writers);
+          return;
+        }
+        if (this.unlock(secret)) new import_obsidian10.Notice("Rhen Vault unlocked. Locked notes stay encrypted on disk.");
+      });
+    }, this.settings.imageHint ?? null).open();
+  }
+  /** Plugin folder only. Missing folders are not replaced with the vault root. */
+  pluginDirectory() {
     const base = this.basePath();
     if (!base) return null;
+    const listed2 = this.manifest.dir;
+    if (listed2 && !listed2.includes("..")) {
+      const fromManifest = path2.join(base, ...listed2.split(/[\\/]/).filter(Boolean));
+      if (import_fs7.default.existsSync(fromManifest)) return fromManifest;
+    }
     const pluginDir = path2.join(base, this.app.vault.configDir, "plugins", this.manifest.id);
-    return import_fs6.default.existsSync(pluginDir) ? pluginDir : base;
+    return import_fs7.default.existsSync(pluginDir) ? pluginDir : null;
+  }
+  /** Folder the permission check reads. The vault root is only a fallback when the plugin folder is missing. */
+  pluginTargetPath() {
+    return this.pluginDirectory() ?? this.basePath();
+  }
+  clearForeignPluginWriters(writers) {
+    if (process.platform !== "win32" || writers.length === 0) return Promise.resolve();
+    if (!this.writerClear) {
+      this.writerClear = this.clearForeignPluginWritersOnce(writers).finally(() => {
+        this.writerClear = null;
+      });
+    }
+    return this.writerClear;
+  }
+  async clearForeignPluginWritersOnce(writers) {
+    const target = this.pluginDirectory();
+    if (!target) return;
+    let script;
+    try {
+      script = clearWritersScript(target, writers);
+    } catch (error) {
+      console.error("Rhen Vault: could not build the permission clear", error);
+      return;
+    }
+    await this.runPowerShellWait(inlineLaunchArgs(script), 3e4);
+    const remaining = await this.foreignPluginWriters();
+    if (remaining.length === 0) return;
+    try {
+      script = clearWritersScript(target, remaining);
+    } catch (error) {
+      console.error("Rhen Vault: could not build the elevated permission clear", error);
+      return;
+    }
+    new import_obsidian10.Notice("Approve the Windows prompt to finish removing that write access.");
+    await this.runPowerShellWait(elevatedLaunchArgs(script, { wait: true }), 18e4);
+  }
+  runPowerShellWait(args, timeoutMs) {
+    return new Promise((resolve2) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve2();
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      try {
+        const child = (0, import_child_process.spawn)("powershell.exe", args, {
+          windowsHide: true,
+          stdio: "ignore"
+        });
+        child.on("error", (error) => {
+          console.error("Rhen Vault: permission clear failed to start", error);
+          finish();
+        });
+        child.on("close", finish);
+      } catch (error) {
+        console.error("Rhen Vault: permission clear failed to start", error);
+        finish();
+      }
+    });
+  }
+  /**
+   * A vault image holds the exact pixels of the unlock image, so any agent
+   * that can open the vault could rebuild the key from it. Deletion stays
+   * confirmed: the original file outside the vault is untouched.
+   */
+  confirmSecretImageRemoval(file) {
+    new ConfirmModal(
+      this.app,
+      {
+        title: "This image cannot be added to the vault",
+        body: `${file.path} is the image your Rhen Vault key was generated with. Anyone or any agent that can open this vault could rebuild your key from it. Delete it from the vault? Your original file outside the vault is untouched.`,
+        confirm: "Delete from vault"
+      },
+      () => {
+        void this.app.vault.delete(file).then(
+          () => new import_obsidian10.Notice("Rhen Vault deleted the unlock image from the vault."),
+          () => new import_obsidian10.Notice("Rhen Vault could not delete that image. Remove it yourself.")
+        );
+      }
+    ).open();
   }
   /** The refusal explained, with fixes. Re-checking re-runs unlock, which passes once the writers are gone. */
   showExposureInfo(writers) {
     const target = this.pluginTargetPath();
+    let fixCommands = null;
+    try {
+      fixCommands = target ? removalCommands(target, writers) : null;
+    } catch (error) {
+      console.error("Rhen Vault: could not build the copyable fix", error);
+    }
     new ExposureModal(
       this.app,
       {
         writers,
         target,
-        fixCommands: target ? removalCommands(target, writers) : null,
+        fixCommands,
         canProtect: this.canUseAccountProtection() && !this.isAccountProtected()
       },
       {
@@ -3304,22 +3802,22 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
     const recovery = host.internalPlugins?.getPluginById?.("file-recovery");
     if (!recovery?.enabled) return;
     if (!recovery.disable) {
-      new import_obsidian5.Notice("Rhen Vault: File recovery is on. Turn it off under Core plugins. It can store plaintext snapshots.");
+      new import_obsidian10.Notice("Rhen Vault: File recovery is on. Turn it off under Core plugins. It can store plaintext snapshots.");
       return;
     }
     try {
       recovery.disable();
-      new import_obsidian5.Notice("Rhen Vault turned off File recovery so it cannot keep plaintext snapshots.");
+      new import_obsidian10.Notice("Rhen Vault turned off File recovery so it cannot keep plaintext snapshots.");
     } catch (error) {
       console.error("Rhen Vault: could not turn off File recovery", error);
-      new import_obsidian5.Notice("Rhen Vault: File recovery is on. Turn it off under Core plugins. It can store plaintext snapshots.");
+      new import_obsidian10.Notice("Rhen Vault: File recovery is on. Turn it off under Core plugins. It can store plaintext snapshots.");
     }
   }
   renderStatus() {
     if (!this.statusEl) return;
     const watching = this.watchedAgents.length ? ` \xB7 ${this.watchedAgents.map(labelForPlugin).join(", ")}` : "";
     if (this.sessionBlocked()) this.statusEl.setText("Rhen Vault: protected account required");
-    else if (!this.settings.verifier) this.statusEl.setText("Rhen Vault: set a passphrase");
+    else if (!this.settings.verifier) this.statusEl.setText("Rhen Vault: choose a secret");
     else if (this.state.key) this.statusEl.setText(`Rhen Vault: open${watching}`);
     else this.statusEl.setText(`Rhen Vault: session locked${watching}`);
   }
@@ -3368,6 +3866,7 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
   }
   registerWatchers() {
     this.watch.register();
+    this.imageGuard.register();
   }
   scheduleGuardSync() {
     this.watch.scheduleGuardSync();
@@ -3439,12 +3938,12 @@ var RhenVaultPlugin = class extends import_obsidian5.Plugin {
         stdio: "ignore",
         windowsHide: true
       });
-      child.on("error", () => new import_obsidian5.Notice("Rhen Vault could not start PowerShell."));
+      child.on("error", () => new import_obsidian10.Notice("Rhen Vault could not start PowerShell."));
       child.unref();
-      new import_obsidian5.Notice(`Approve the Windows prompt, then choose a password for ${ACCOUNT_NAME}. Nothing moves until Windows accepts it.`);
+      new import_obsidian10.Notice(`Approve the Windows prompt, then choose a password for ${ACCOUNT_NAME}. Nothing moves until Windows accepts it.`);
     } catch (error) {
       console.error("Rhen Vault: elevated setup failed to start", error);
-      new import_obsidian5.Notice("Rhen Vault could not start the setup window.");
+      new import_obsidian10.Notice("Rhen Vault could not start the setup window.");
     }
   }
   reportAgentAccess(filePath, agentId, action) {
