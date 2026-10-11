@@ -650,14 +650,16 @@ function isRecord(value) {
 function asImageHint(value) {
   if (!isRecord(value)) return null;
   const name = typeof value.name === "string" ? value.name.trim().slice(0, 200) : "";
-  const width = value.width;
-  const height = value.height;
-  const bytes = value.bytes;
-  if (!name) return null;
-  if (!Number.isInteger(width) || width < 1 || width > 1e5) return null;
-  if (!Number.isInteger(height) || height < 1 || height > 1e5) return null;
-  if (!Number.isInteger(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) return null;
+  const width = asSafeInt(value.width, 1, 1e5);
+  const height = asSafeInt(value.height, 1, 1e5);
+  const bytes = asSafeInt(value.bytes, 0, Number.MAX_SAFE_INTEGER);
+  if (!name || width === null || height === null || bytes === null) return null;
   return { name, width, height, bytes };
+}
+function asSafeInt(value, min, max) {
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  if (value < min || value > max || !Number.isSafeInteger(value)) return null;
+  return value;
 }
 function mergeSettings(loaded) {
   const source = isRecord(loaded) ? loaded : null;
@@ -1192,7 +1194,7 @@ var SetupModal = class extends import_obsidian2.Modal {
     contentEl.createEl("h3", { text: "Image" });
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: "Rhen Vault samples 128 colors from the same places in the picture every time, so the right file always unlocks. The picture is not saved. Its name and size are remembered. Moving or renaming the file is fine. Editing or re-saving it changes the pixels and will fail. Keep it outside this vault. If a copy is added to the vault later, Rhen Vault warns you and can delete that copy. The original outside the vault stays."
+      text: "Rhen Vault samples 128 colors from the same places in the picture every time, so the right file always unlocks. The picture is not saved, and its name is not shown later. Moving or renaming the file is fine. Editing or re-saving it changes the pixels and will fail. Keep it outside this vault. If a copy is added to the vault later, Rhen Vault warns you and can delete that copy. The original outside the vault stays."
     });
     const imageInput = contentEl.createEl("input", { cls: "rhen-file-input", type: "file" });
     imageInput.hidden = true;
@@ -1245,13 +1247,12 @@ var SetupModal = class extends import_obsidian2.Modal {
   }
 };
 var UnlockModal = class extends import_obsidian2.Modal {
-  constructor(app, kind, vaultPath, salt, onSubmit, hint = null, options = {}) {
+  constructor(app, kind, vaultPath, salt, onSubmit, options = {}) {
     super(app);
     this.kind = kind;
     this.vaultPath = vaultPath;
     this.salt = salt;
     this.onSubmit = onSubmit;
-    this.hint = hint;
     this.options = options;
   }
   passphrase = "";
@@ -1284,7 +1285,7 @@ var UnlockModal = class extends import_obsidian2.Modal {
   imageUnlock(contentEl) {
     contentEl.createEl("p", {
       cls: "rhen-note",
-      text: this.options.showHint !== false && this.hint ? `Choose the same image file you used when Rhen Vault was set up: ${this.hint.name} (${this.hint.width} by ${this.hint.height}, ${this.hint.bytes} bytes). Moving or renaming it is fine. A copy with different pixels will fail. It still has to sit outside this vault.` : "Choose the same image file you used when Rhen Vault was set up. Moving or renaming it is fine. A copy with different pixels will fail. It still has to sit outside this vault."
+      text: "Choose the same image file you used when Rhen Vault was set up. Moving or renaming it is fine. A copy with different pixels will fail. It still has to sit outside this vault."
     });
     const imageInput = contentEl.createEl("input", { cls: "rhen-file-input", type: "file" });
     imageInput.hidden = true;
@@ -2891,13 +2892,12 @@ var RhenVaultPlugin = class extends import_obsidian10.Plugin {
       disablePluginAndSave: plugins.disablePluginAndSave,
       uninstallPlugin: plugins.uninstallPlugin
     };
-    const host = this;
     const gate = async (id, run) => {
       if (!run) return;
-      if (id !== host.manifest.id) return run.call(plugins, id);
-      host.markEnabled();
-      if (!await host.allowShutdown()) {
-        await host.keepEnabled();
+      if (id !== this.manifest.id) return run.call(plugins, id);
+      this.markEnabled();
+      if (!await this.allowShutdown()) {
+        await this.keepEnabled();
         return false;
       }
       return run.call(plugins, id);
@@ -3021,12 +3021,10 @@ var RhenVaultPlugin = class extends import_obsidian10.Plugin {
           accepted = true;
           return true;
         },
-        null,
         {
           title: "Turn off Rhen Vault",
           intro: "Enter your password or choose your image to turn the plugin off. Closing this leaves it enabled. Locked notes stay encrypted.",
           confirm: "Turn off",
-          showHint: false,
           onDismiss: () => finish(accepted)
         }
       ).open();
@@ -3678,7 +3676,7 @@ var RhenVaultPlugin = class extends import_obsidian10.Plugin {
         }
         if (this.unlock(secret)) new import_obsidian10.Notice("Rhen Vault unlocked. Locked notes stay encrypted on disk.");
       });
-    }, this.settings.imageHint ?? null).open();
+    }).open();
   }
   /** Plugin folder only. Missing folders are not replaced with the vault root. */
   pluginDirectory() {
@@ -3733,10 +3731,10 @@ var RhenVaultPlugin = class extends import_obsidian10.Plugin {
       const finish = () => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        window.clearTimeout(timer);
         resolve2();
       };
-      const timer = setTimeout(finish, timeoutMs);
+      const timer = window.setTimeout(finish, timeoutMs);
       try {
         const child = (0, import_child_process.spawn)("powershell.exe", args, {
           windowsHide: true,
@@ -3767,7 +3765,7 @@ var RhenVaultPlugin = class extends import_obsidian10.Plugin {
         confirm: "Delete from vault"
       },
       () => {
-        void this.app.vault.delete(file).then(
+        void this.app.fileManager.trashFile(file).then(
           () => new import_obsidian10.Notice("Rhen Vault deleted the unlock image from the vault."),
           () => new import_obsidian10.Notice("Rhen Vault could not delete that image. Remove it yourself.")
         );
